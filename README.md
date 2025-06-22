@@ -96,6 +96,37 @@ Contribuições para melhorias e novas funcionalidades são bem-vindas!
 
 Este projeto está licenciado sob a [MIT License](LICENSE).
 
----
+# IAssistant
 
-Dih, este README abrange a estrutura, o funcionamento e os pontos críticos da sua aplicação IAssistant. Sinta-se à vontade para ajustar os detalhes conforme o desenvolvimento evolui ou para adicionar seções específicas que forem necessárias. Se precisar de mais informações sobre a integração com o backend ou ajuda com detalhes técnicos, posso colaborar com orientações adicionais!
+O **IAssistant** é uma ferramenta em Python desenvolvida para analisar conteúdos textuais de documentos (PDF, HTML, TXT, CSV) e calcular métricas de similaridade entre frases extraídas dos documentos e termos de busca informados pelo usuário. Além disso, o projeto integra uma interface interativa—por meio do Dash e Plotly—para visualizar frequências, estatísticas e gráficos que evidenciam os resultados da análise.
+
+## Funcionalidades
+
+- **Extração e Processamento de Conteúdo:**
+  - Suporte à leitura de documentos em diversos formatos:
+    - PDFs (usando o PyMuPDF, via o módulo `fitz`)
+    - Arquivos HTML, TXT e CSV através de tratamento de conteúdo ou requisições HTTP
+  - Tokenização do texto utilizando NLTK, com remoção de stopwords (para os idiomas inglês e português) e limpeza textual via expressões regulares.
+
+- **Análise de Similaridade e Frequência:**
+  - Cálculo de métricas de similaridade (por meio do **cosine similarity**) entre o conteúdo extraído e os termos de busca desejados.
+  - Divisão do documento em partes (splits por frases) para facilitar a análise por página ou por trecho.
+  - Geração de distribuições de frequência usando `FreqDist` do NLTK e construção de dataframes no Pandas, permitindo a visualização e o agrupamento dos dados.
+
+- **Armazenamento e Manipulação de Dados:**
+  - Classes dedicadas à manipulação de arquivos: salvando conteúdo em formatos HTML, TXT e PDF.
+  - Integração com um sistema de gerenciamento de dados via `BaseManager` para compartilhamento de informações entre processos.
+
+- **Dashboards e Visualização Interativa:**
+  - Criação de interfaces gráficas interativas utilizando o [Dash](https://dash.plotly.com/) e [Plotly](https://plotly.com/python/), com elementos como gráficos de dispersão, barras e tabelas dinâmicas.
+  - Componentes interativos (dropdowns, botões e popovers via dash-bootstrap-components) que permitem filtrar os dados e visualizar métricas detalhadas por página, palavra e frase.
+  - Funções utilitárias para definir cores (baseado na intensidade dos valores) que auxiliam na representação visual dos níveis de similaridade (ex.: vermelho para baixa similaridade, verde para alta).
+
+- **Configuração Dinâmica do Backend:**
+  - Funções para obter configurações dinâmicas de endpoints e dados de busca (através de GET requests para URLs configuradas).  
+    **Atenção:** Por padrão, esses endpoints utilizam `http://localhost:8080`. Em produção, é necessário atualizar esse valor para um domínio público e acessível, evitando erros de conexão.
+
+## Estrutura do Projeto
+
+A pasta do projeto conta com os seguintes arquivos e subdiretórios básicos:
+
