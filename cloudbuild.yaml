@@ -1,16 +1,16 @@
 steps:
-  - name: gcr.io/cloud-builders/gcloud
-    entrypoint: bash
-    args:
-      - -euo
-      - pipefail
-      - -c
-      - |
-          apt-get update -y && apt-get install -y jq
-          chmod +x scripts/apply_bq.sh
-          scripts/apply_bq.sh "${_PROJECT}" "${_BASE_DS}" "${_VIEWS_DS}"
+- name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+  - -uec
+  - |
+      apt-get update -y && apt-get install -y jq
+      bash scripts/apply_bq.sh "${_PROJECT}" "${_BASE_DS}" "${_VIEWS_DS}"
+
 substitutions:
   _PROJECT: case-de-engenharia-de-dados
   _BASE_DS: "845415315315"
   _VIEWS_DS: sec_v
-timeout: "1200s"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
