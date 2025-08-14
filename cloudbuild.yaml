@@ -1,17 +1,12 @@
-# cloudbuild.yaml
 steps:
   - name: gcr.io/cloud-builders/gcloud
     entrypoint: bash
     args:
+      - -euo
+      - pipefail
       - -c
       - |
-        set -euxo pipefail
-        apt-get update && apt-get install -y jq
-        bash scripts/apply_bq.sh "$_PROJECT" "$_BASE_DS" "$_VIEWS_DS"
-
-substitutions:
-  _PROJECT: case-de-engenharia-de-dados
-  _BASE_DS: "845415315315"
-  _VIEWS_DS: sec_v
-
-timeout: "1200s"
+          apt-get update -y && apt-get install -y jq
+          bash scripts/apply_bq.sh "$PROJECT_ID" 845415315315 sec_v
+options:
+  logging: CLOUD_LOGGING_ONLY
