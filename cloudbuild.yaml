@@ -1,12 +1,17 @@
 steps:
-  - name: gcr.io/cloud-builders/gcloud
-    entrypoint: bash
-    args:
-      - -euo
-      - pipefail
-      - -c
-      - |
-          apt-get update -y && apt-get install -y jq
-          bash scripts/apply_bq.sh "$PROJECT_ID" 845415315315 sec_v
-options:
-  logging: CLOUD_LOGGING_ONLY
+- name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+    - -c
+    - |
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      # garante projeto no ambiente do builder (bq usa essa env var)
+      export CLOUDSDK_CORE_PROJECT=${_PROJECT}
+      apt-get update -y && apt-get install -y jq
+      bash scripts/apply_bq.sh "${_PROJECT}" "${_BASE_DS}" "${_VIEWS_DS}"
+substitutions:
+  _PROJECT: case-de-engenharia-de-dados
+  _BASE_DS: "845415315315"
+  _VIEWS_DS: "sec_v"
+timeout: "1200s"
