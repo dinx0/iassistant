@@ -1,3 +1,598 @@
+# BigQuery IAM + Authorized Views
+
+Eu montei este projeto para gerenciar acesso no BigQuery a partir de uma tabela de usuarios e expor dados sensiveis apenas via views mascaradas. Aqui deixo o passo a passo que realmente funcionou no meu ambiente `case-de-engenharia-de-dados`, apenas o que foi executado com sucesso.
+
+---
+
+## Como eu trago os dados (extracao/ingestao)
+
+**Fontes e formatos**
+
+* Fonte 1 (proximo do real): metrica de busca do meu IA Assistant via API do Google Cloud + extensao do Chrome. Esses eventos chegam ja normalizados pela API.
+* Fonte 2 (ficticia para o projeto): base de usuarios em JSON (newline-delimited). 99% dos registros sao sinteticos.
+
+**Pipelines e modo de chegada**
+
+* **Streaming (quase tempo real)** para a tabela `phrase_metrics`:
+
+  * a extensao envia eventos para minha API e eu faco **streaming inserts** direto no BigQuery (sem ETL intermediario). O dado ja vem tratado pela propria API, entao aplico so cast/normalizacao leve na view.
+  * modelo aqui e "padrao kappa (event-driven)": eventos entram continuamente e eu consulto sempre a versao mais recente no BQ.
+* **Lote (batch)** para a tabela `user_iassistant`:
+
+  * eu **carrego JSON** para o BigQuery usando load jobs (`bq load`), quando preciso renovar a base. E um fluxo de dimensao/carga inicial.
+  * sem orquestrador dedicado: uso scripts shell + `bq`/`jq`. As mascaras e regras de acesso ficam nas **views** e no **IAM do dataset**.
+
+**Por que assim**
+
+* Quero focar no controle de acesso e mascaramento no proprio BigQuery (menos componentes).
+* Streaming direto evita ETL quando o produtor ja valida o schema.
+* Batch em JSON resolve bem para carga inicial e dados ficticios do case.
+
+---
+
+## Arquitetura final (o que esta rodando)
+
+* **Projeto**: `case-de-engenharia-de-dados`
+* **Dataset base**: `845415315315` (mesma regiao usada em `sec_v`)
+* **Dataset de views**: `sec_v` (criado/recriado na mesma regiao do dataset base)
+* **Tabelas base**:
+
+  * `user_iassistant` — PK logica: `USER_ID (INT64)`
+  * `phrase_metrics` — sem PK fisica; relaciona por `user_id (STRING)`
+* **Views mascaradas (em producao)**:
+
+  * `sec_v.user_iassistant_v` — mascara email e lat/lon extraida de `REGION`
+  * `sec_v.phrase_metrics_v` — mascara `PHRASE_TEXT` e `SEARCH_RESULT`
+* **Relacao**: `USER_IASSISTANT.USER_ID (INT64)` <-> `PHRASE_METRICS.user_id (STRING)` via `CAST`.
+
+---
+
+## IAM via tabela (o que eu rodei)
+
+Regra simples: `USER_ID 1..5 => READER`, `USER_ID >= 6 => WRITER` no dataset base `845415315315`. Eu gero as entradas `access[]` com `bq` + `jq` e aplico sem duplicar.
+
+```bash
+# variaveis
+export PROJECT_ID="case-de-engenharia-de-dados"
+export DATASET_ID="845415315315"
+export DATASET_REF="$PROJECT_ID:$DATASET_ID"
+export SRC_TABLE="$PROJECT_ID.$DATASET_ID.user_iassistant"
+
+# loop a partir da tabela (evita duplicacoes)
+bq query --nouse_legacy_sql --format=csv "
+WITH base AS (
+  SELECT DISTINCT CAST(USER_ID AS INT64) AS user_id,
+         LOWER(TRIM(USER_EMAIL)) AS email
+  FROM \`$SRC_TABLE\`
+  WHERE USER_EMAIL IS NOT NULL
+)
+SELECT email,
+       CASE WHEN user_id BETWEEN 1 AND 5 THEN 'READER' ELSE 'WRITER' END AS role
+FROM base
+" | tail -n +2 | while IFS=, read -r email role; do
+  [[ -z "$email" || -z "$role" ]] && continue
+  bq show --format=prettyjson "$DATASET_REF" > ds.tmp.json
+  jq --arg em "$email" --arg r "$role" \
+     '.access += [{"role":$r,"userByEmail":$em}] | .access |= (map(tojson)|unique|map(fromjson))' \
+     ds.tmp.json > ds.apply.json
+  bq update --source=ds.apply.json "$DATASET_REF"
+  rm -f ds.tmp.json ds.apply.json
+done
+```
+
+Nota: emails ficticios/inexistentes o BigQuery recusa (nao entram na policy).
+
+---
+
+## Views mascaradas (SQL que eu apliquei)
+
+### `sec_v.user_iassistant_v`
+
+* `email_mascarado`: primeira letra + \*\*\* + dominio
+* `lat_mascarada` / `lon_mascarada`: extraidas de `REGION` com regex e `ROUND(..., 2)`
+
+```sql
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.user_iassistant_v` AS
+SELECT
+  CAST(USER_ID AS INT64) AS user_id,
+  CONCAT(
+    SUBSTR(LOWER(TRIM(USER_EMAIL)),1,1),
+    '***',
+    REGEXP_EXTRACT(LOWER(TRIM(USER_EMAIL)), r'(@.*)$')
+  ) AS email_mascarado,
+  ROUND(
+    IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>0,
+       CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(0)] AS FLOAT64), NULL),
+    2
+  ) AS lat_mascarada,
+  ROUND(
+    IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>1,
+       CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(1)] AS FLOAT64), NULL),
+    2
+  ) AS lon_mascarada
+FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`;
+```
+
+### `sec_v.phrase_metrics_v`
+
+* `phrase_text_masked = SUBSTR(PHRASE_TEXT, 1, 20) || '...'`
+* `search_result_masked = SUBSTR(SEARCH_RESULT, 1, 60) || '...'`
+
+```sql
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.phrase_metrics_v` AS
+SELECT
+  CAST(user_id AS STRING) AS user_id,
+  CAST(PHRASE_METRICS AS FLOAT64) AS phrase_metrics,
+  IFNULL(SUBSTR(PHRASE_TEXT, 1, 20) || '...', NULL) AS phrase_text_masked,
+  CAST(PAGE_METRICS AS INT64) AS page_metrics,
+  CAST(PAGE_NUMBER AS INT64) AS page_number,
+  SEARCH_ITEMS AS search_items,
+  IFNULL(SUBSTR(SEARCH_RESULT, 1, 60) || '...', NULL) AS search_result_masked,
+  CAST(DT_CARGA AS INT64) AS dt_carga
+FROM `case-de-engenharia-de-dados.845415315315.phrase_metrics`;
+```
+
+### Authorized View no dataset base (eu adicionei assim)
+
+```bash
+BASE="case-de-engenharia-de-dados:845415315315"
+LOC=$(bq show --format=prettyjson "$BASE" | jq -r .location)
+
+# garante dataset de views na mesma regiao
+bq mk --dataset --location="$LOC" case-de-engenharia-de-dados:sec_v 2>/dev/null || true
+
+bq show --format=prettyjson "$BASE" > base.json
+jq '.access += [
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"user_iassistant_v"}},
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"phrase_metrics_v"}}
+] | .access |= (map(tojson)|unique|map(fromjson))' base.json > base_patched.json
+bq update --source=base_patched.json "$BASE"
+```
+
+---
+
+## Relacao e consultas
+
+Chave logica: `USER_IASSISTANT.USER_ID (INT64)` <-> `PHRASE_METRICS.user_id (STRING)` via `CAST`.
+
+```sql
+SELECT
+  u.USER_ID,
+  v.email_mascarado,
+  p.phrase_metrics,
+  p.phrase_text_masked,
+  p.search_result_masked,
+  p.page_metrics,
+  p.page_number,
+  p.dt_carga
+FROM `case-de-engenharia-de-dados.sec_v.user_iassistant_v` AS v
+JOIN `case-de-engenharia-de-dados.845415315315.user_iassistant` AS u
+  ON v.user_id = u.USER_ID
+JOIN `case-de-engenharia-de-dados.sec_v.phrase_metrics_v` AS p
+  ON CAST(p.user_id AS INT64) = u.USER_ID
+LIMIT 100;
+```
+
+---
+
+## Como reproduzir rapido (copy/paste)
+
+> pre requisitos: `gcloud` autenticado no projeto, `bq` e `jq` instalados; habilitar **Data Access logs** para BigQuery no Console (IAM e Admin > Audit Logs), e criar o dataset base `845415315315` previamente.
+
+```bash
+# 0) variaveis
+export PROJECT_ID=case-de-engenharia-de-dados
+export BASE=case-de-engenharia-de-dados:845415315315
+export VIEWS=case-de-engenharia-de-dados:sec_v
+
+# 1) detectar regiao do dataset base e recriar o dataset de views na mesma regiao
+LOC=$(bq show --format=prettyjson "$BASE" | jq -r .location)
+bq rm -f -d "$VIEWS" 2>/dev/null || true
+bq mk --dataset --location="$LOC" "$VIEWS"
+
+# 2) criar/atualizar as views mascaradas
+bq query --use_legacy_sql=false --location="$LOC" <<'SQL'
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.user_iassistant_v` AS
+SELECT
+  CAST(USER_ID AS INT64) AS user_id,
+  CONCAT(SUBSTR(LOWER(TRIM(USER_EMAIL)),1,1),'***',REGEXP_EXTRACT(LOWER(TRIM(USER_EMAIL)), r'(@.*)$')) AS email_mascarado,
+  ROUND(IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>0,
+           CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(0)] AS FLOAT64), NULL),2) AS lat_mascarada,
+  ROUND(IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>1,
+           CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(1)] AS FLOAT64), NULL),2) AS lon_mascarada
+FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`;
+SQL
+
+bq query --use_legacy_sql=false --location="$LOC" <<'SQL'
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.phrase_metrics_v` AS
+SELECT
+  CAST(user_id AS STRING) AS user_id,
+  CAST(PHRASE_METRICS AS FLOAT64) AS phrase_metrics,
+  IFNULL(SUBSTR(PHRASE_TEXT, 1, 20) || '...', NULL) AS phrase_text_masked,
+  CAST(PAGE_METRICS AS INT64) AS page_metrics,
+  CAST(PAGE_NUMBER AS INT64) AS page_number,
+  SEARCH_ITEMS AS search_items,
+  IFNULL(SUBSTR(SEARCH_RESULT, 1, 60) || '...', NULL) AS search_result_masked,
+  CAST(DT_CARGA AS INT64) AS dt_carga
+FROM `case-de-engenharia-de-dados.845415315315.phrase_metrics`;
+SQL
+
+# 3) autorizar as views no dataset base
+bq show --format=prettyjson "$BASE" > base.json
+jq '.access += [
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"user_iassistant_v"}},
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"phrase_metrics_v"}}
+] | .access |= (map(tojson)|unique|map(fromjson))' base.json > base_patched.json
+bq update --source=base_patched.json "$BASE"
+
+# 4) criar SA de leitura e testar impersonation
+SA=bq-viewer-demo
+EMAIL="$SA@$PROJECT_ID.iam.gserviceaccount.com"
+gcloud iam service-accounts create "$SA" 2>/dev/null || true
+# papel de job no projeto (criar consultas)
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$EMAIL" --role="roles/bigquery.jobUser" >/dev/null
+# acesso somente no dataset de views
+bq update --dataset_access add:serviceAccount:$EMAIL:READER "$VIEWS"
+# garantir que NAO tem acesso na base
+bq update --dataset_access remove:serviceAccount:$EMAIL "$BASE" 2>/dev/null || true
+# testar como SA
+MEU=$(gcloud config get-value account)
+gcloud iam service-accounts add-iam-policy-binding "$EMAIL" \
+  --member="user:$MEU" --role="roles/iam.serviceAccountTokenCreator" >/dev/null
+
+gcloud config set auth/impersonate_service_account "$EMAIL" >/dev/null
+# deve falhar na base
+bq query --nouse_legacy_sql 'SELECT COUNT(1) FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`' || true
+# deve funcionar na view
+bq query --nouse_legacy_sql 'SELECT * FROM `case-de-engenharia-de-dados.sec_v.user_iassistant_v` LIMIT 5'
+# desfazer impersonation
+gcloud config unset auth/impersonate_service_account >/dev/null
+```
+
+> se o seu projeto estiver em outro local, ajuste `PROJECT_ID`, datasets e os nomes das views.
+
+---
+
+## Validacao (como eu testei)
+
+* Criei a SA `bq-viewer-demo@case-de-engenharia-de-dados.iam.gserviceaccount.com` com:
+
+  * `READER` **so** em `sec_v`
+  * `roles/bigquery.jobUser` no **projeto** (para criar jobs)
+* Removi qualquer acesso dessa SA no dataset base
+* Resultado: na base deu **Access Denied** (como esperado) e nas views funcionou com os dados mascarados
+
+---
+
+## Observabilidade e logs (o que eu configurei e validei)
+
+Eu queria saber se alguem leu a tabela **base** direto (bypass da view). Entao primeiro validei o filtro no formato novo `BigQueryAuditMetadata`, depois criei a metrica. Importante: habilitar **Data Access logs** de BigQuery no projeto.
+
+### Pre check (CLI)
+
+```bash
+gcloud logging read \
+  'logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+   AND resource.type="bigquery_dataset" \
+   AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+   AND protoPayload.metadata.tableDataRead.reason:* \
+   AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"' \
+  --limit=5 \
+  --format='value(timestamp, protoPayload.metadata.tableDataRead.reason, protoPayload.resourceName)'
+```
+
+### Criacao da metrica
+
+```bash
+gcloud logging metrics create read_base_dataset_metric \
+  --description="Leituras na tabela base (bypass da view)" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_dataset" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.tableDataRead.reason:* \
+                AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"'
+```
+
+### Status (deu certo no meu projeto)
+
+* Habilitei **Data Access logs** para BigQuery (e BigQuery Storage API) no projeto.
+* Os comandos `gcloud logging read` retornaram eventos de leitura da tabela base, validando o filtro.
+* Ao criar a metrica recebi `subject of a conflict` porque ela **ja existia**; a metrica `read_base_dataset_metric` ja existia e permanece ativa.
+
+### Regras extras de logging/alerta (recomendado)
+
+Abaixo deixo mais regras que eu apliquei/validei para ampliar a cobertura de auditoria e justificar auditoria:
+
+#### 1) Quem referenciou a tabela base em consultas (mesmo via JOIN)
+
+**Por que**: pega consultas que citam a base; util para diferenciar "via view" de "via tabela".
+
+```bash
+gcloud logging metrics create query_ref_base_table_metric \
+  --description="Queries que referenciam a tabela base" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_project" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.jobCompletedEvent.job.jobStatistics.referencedTables:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"'
+```
+
+#### 2) Leituras que bateram na **view** (conforme esperado)
+
+**Por que**: monitora o caminho certo de consumo (autorizado/mascarado).
+
+```bash
+gcloud logging metrics create read_via_view_metric \
+  --description="Leituras na authorized view" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_dataset" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.tableDataRead.reason:* \
+                AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/sec_v/tables/user_iassistant_v"'
+```
+
+#### 3) DML/ingest na tabela base
+
+**Por que**: rastrear escrita e volume.
+
+```bash
+gcloud logging metrics create base_table_dml_metric \
+  --description="Mudancas de dados na tabela base" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_dataset" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.tableDataChange:* \
+                AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"'
+```
+
+#### 4) Mudancas de schema/permissao no dataset base
+
+**Por que**: detectar alteracoes de schema e IAM fora do pipeline controlado.
+
+```bash
+gcloud logging metrics create base_schema_or_policy_change_metric \
+  --description="Alteracoes de schema/IAM no dataset base" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_dataset" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND (protoPayload.metadata.tableMetadataChange:* OR protoPayload.metadata.datasetChange:*) \
+                AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315"'
+```
+
+#### 5) Alertas em cima das metricas (ex.: leu a base)
+
+**Por que**: acionar time quando houver bypass da view.
+
+```bash
+CHANNEL="projects/case-de-engenharia-de-dados/notificationChannels/XXXXXXXXXXXX"  # substitua
+POLICY_BODY=$(cat <<'JSON'
+{
+  "displayName": "Alerta: leitura direta na base",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "read_base_dataset_metric > 0",
+      "conditionThreshold": {
+        "filter": "metric.type=\"logging.googleapis.com/user/read_base_dataset_metric\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "300s"
+      }
+    }
+  ],
+  "notificationChannels": ["CHANNEL_PLACEHOLDER"]
+}
+JSON
+)
+# gcloud alpha monitoring policies create --policy "$POLICY_BODY" | sed "s/CHANNEL_PLACEHOLDER/$CHANNEL/"
+```
+
+*(eu deixei o create comentado para voce so habilitar quando ja tiver o canal de notificacao pronto)*
+
+#### 6) Retencao e analytics dos logs
+
+**Por que**: manter trilha por mais tempo e permitir SQL em logs.
+
+```bash
+# opcional: bucket dedicado
+gcloud logging buckets create bq-security --location=global
+
+# opcional: sink dos data_access para um dataset BigQuery
+bq --location=US mk -d --description "Audit logs do projeto" audit_logs 2>/dev/null || true
+SVC=$(gcloud logging sinks create sink-bq-audit \
+  bigquery.googleapis.com/projects/case-de-engenharia-de-dados/datasets/audit_logs \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access"' \
+  --format='value(writerIdentity)')
+# conceder acesso no dataset para o SA do sink
+bq update --dataset_access add:group:projectReaders audit_logs 2>/dev/null || true
+# (se preferir, conceda ao writerIdentity retornado acima: roles/bigquery.dataEditor)
+```
+
+#### 7) Falhas de permissao (PERMISSION\_DENIED)
+
+**Por que**: captura tentativas fora do fluxo (ex.: usuario/SA tentando ler base sem permissao). Ajuda a evidenciar bypass bloqueado.
+
+```bash
+gcloud logging metrics create bq_permission_denied_metric \
+  --description="Tentativas PERMISSION_DENIED no BigQuery" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Factivity" \
+                AND protoPayload.serviceName="bigquery.googleapis.com" \
+                AND protoPayload.status.code=7'
+```
+
+> Observacao: para focar na sua base, complemente com `AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315"`.
+
+#### 8) Consulta pesada (custo)
+
+**Por que**: sinaliza consultas com alto `totalBilledBytes` (custo/risco). Bom para controlar SLAs e budget.
+
+```bash
+gcloud logging metrics create heavy_query_metric \
+  --description="Queries com totalBilledBytes >= 1GB" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_project" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.jobCompletedEvent.eventName="job_completed" \
+                AND protoPayload.metadata.jobCompletedEvent.job.jobStatistics.totalBilledBytes>=1000000000'
+```
+
+Opcional: alerta simples para quando ocorrer (substitua o canal):
+
+```bash
+CHANNEL="projects/case-de-engenharia-de-dados/notificationChannels/XXXXXXXXXXXX"
+POLICY=$(cat <<'JSON'
+{
+  "displayName": "Alerta: consulta pesada (>=1GB)",
+  "combiner": "OR",
+  "conditions": [
+    {
+      "displayName": "heavy_query_metric > 0",
+      "conditionThreshold": {
+        "filter": "metric.type=\"logging.googleapis.com/user/heavy_query_metric\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0,
+        "duration": "300s"
+      }
+    }
+  ],
+  "notificationChannels": ["CHANNEL_PLACEHOLDER"]
+}
+JSON
+)
+# gcloud alpha monitoring policies create --policy "$POLICY" | sed "s/CHANNEL_PLACEHOLDER/$CHANNEL/"
+```
+
+**Resumo do "por que"**
+
+* Base vs View: separar metricas ajuda a auditar desvio de consumo.
+* DML e schema/IAM: garantem trilha de mudanca e responsabilizacao.
+* Alerting: fecha o loop com acao (pager/email) quando algo anormal acontecer.
+* Retencao/analytics: permite forense com SQL em cima de logs.
+
+---
+
+## Seguranca e privacidade (em uso)
+
+* **Authorized Views**: consumidores so leem as views `sec_v.*`, onde aplico mascaras de email e lat/lon e redacao de texto.
+* **IAM enxuto**: a service account de leitura tem permissao apenas no `sec_v` e papel `bigquery.jobUser` no projeto para executar jobs; sem acesso ao dataset base.
+* **Data Access Logs**: habilitados para auditar `tableDataRead`, DML, mudancas de schema e IAM.
+* **Sensitive Data Protection (DLP)**: ativei a inspecao de dados no projeto para identificar padroes sensiveis (email, possiveis localizacoes). Uso como visibilidade/monitoramento, sem bloqueio automatico.
+
+### Nao aplicado por escopo/limitacao do projeto
+
+* **Policy Tags / Data Catalog**: criacao de DataPolicy exige organizacao; meu projeto e standalone, entao deixei como melhoria futura.
+* **Row-level Security (RLS)**: tentativa de `CREATE ROW ACCESS POLICY` falhou por grupo inexistente; mantive o modelo com authorized view, que resolve a necessidade funcional.
+
+---
+
+## Estado atual (bq show do dataset base)
+
+Comando que usei:
+
+```bash
+bq show case-de-engenharia-de-dados:845415315315
+```
+
+Resumo do que apareceu no meu ambiente (conferido via terminal):
+
+* **Authorized Views**: `case-de-engenharia-de-dados:sec_v.user_iassistant_v` listado (conforme esperado).
+* **Members (recorte)**: varios emails validos, o grupo implicito `projectReaders` e a SA `bq-viewer-demo@case-de-engenharia-de-dados.iam.gserviceaccount.com`.
+* \*\*Schema da tabela \*\*\`\`:
+
+  * `REGION`: STRING
+  * `USER_EMAIL`: STRING
+  * `USER_NAME`: STRING
+  * `USER_ID`: INTEGER
+  * `DT_CARGA`: INTEGER
+* **Particionamento**: por `HOUR`, com `expirationMs=5184000000` (\~60 dias).
+* **Total rows**: `1000`.
+* **Total logical bytes**: \~`88 KB`.
+
+Isso confirma que:
+
+1. o dataset base esta com a authorized view ativa,
+2. a tabela esta com schema/particionamento conforme esperado,
+3. as entradas de IAM estao no lugar (incluindo a SA de viewer que usei para testar acesso somente nas views mascaradas).
+
+---
+
+## Como subir este README no GitHub (Cloud Shell)
+
+Abaixo deixo o que eu usei para colocar este README no repo `dinx0/iassistant`.
+
+### Pre requisitos
+
+* ter o repo no GitHub: `https://github.com/dinx0/iassistant`
+* estar logado no Cloud Shell
+
+### 0) identidade do git (uma vez so)
+
+```bash
+git config --global user.name "Dih Oliver"
+git config --global user.email "dih.oliver08@gmail.com"
+```
+
+### 1) se o repo ja estiver clonado
+
+```bash
+cd ~/iassistant          # entre no diretorio do repo
+nano README.md           # cole/edite o conteudo deste arquivo
+# salve (Ctrl+O, Enter) e saia (Ctrl+X)
+
+git add README.md
+git commit -m "docs: adiciona README do projeto (BigQuery + views + logging)"
+```
+
+### 2) se ainda nao tiver clonado
+
+```bash
+git clone https://github.com/dinx0/iassistant.git
+cd iassistant
+nano README.md
+# salve e saia
+
+git add README.md
+git commit -m "docs: adiciona README do projeto (BigQuery + views + logging)"
+```
+
+### 3) autenticar e fazer o push (recomendado: GitHub CLI)
+
+```bash
+sudo apt-get update && sudo apt-get install -y gh
+gh auth login -w        # GitHub.com -> HTTPS -> abrir no navegador e confirmar
+
+git branch -M main      # garante que a branch e main
+git push -u origin main
+```
+
+### Alternativas de autenticacao
+
+* **HTTPS com token (PAT)**: gere um token com escopo `repo` em *Settings -> Developer settings -> Personal access tokens*. No `git push`, use `dinx0` como username e cole o token no campo de password.
+* **SSH**: gere uma chave `ed25519` (`ssh-keygen -t ed25519 -C "dih.oliver08@gmail.com"`), adicione a publica em *Settings -> SSH and GPG keys*, e troque a URL remota:
+
+  ```bash
+  git remote set-url origin git@github.com:dinx0/iassistant.git
+  git push -u origin main
+  ```
+
+### Dica: limpar credencial errada em cache (se pedir username esquisito)
+
+```bash
+git config --global --unset credential.helper 2>/dev/null || true
+git credential reject <<EOF
+protocol=https
+host=github.com
+EOF
+```
+
+### Conferencia
+
+```bash
+git log --oneline -n 3
+git remote -v
+```
+
+
 # IAssistant
 
 **IAssistant** é uma extensão Chrome desenvolvida para auxiliar na análise de resultados de buscas por meio de tokenização. A extensão calcula percentuais de similaridade entre a consulta realizada e os resultados obtidos, permitindo a visualização de métricas e gráficos que podem ser integrados a um serviço em nuvem (como o BigQuery).
@@ -125,8 +720,6 @@ O **IAssistant** é uma ferramenta em Python desenvolvida para analisar conteúd
 - **Configuração Dinâmica do Backend:**
   - Funções para obter configurações dinâmicas de endpoints e dados de busca (através de GET requests para URLs configuradas).  
     **Atenção:** Por padrão, esses endpoints utilizam `http://localhost:8080`. Em produção, é necessário atualizar esse valor para um domínio público e acessível, evitando erros de conexão.
+    
 
-## Estrutura do Projeto
-
-A pasta do projeto conta com os seguintes arquivos e subdiretórios básicos:
 
