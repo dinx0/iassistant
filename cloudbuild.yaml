@@ -1,0 +1,7 @@
+steps:
+- name: gcr.io/cloud-builders/gcloud
+  entrypoint: bash
+  args:
+  - -c
+  - |
+      bash scripts/apply_bq.sh case-de-engenharia-de-dados 845415315315 sec_v
