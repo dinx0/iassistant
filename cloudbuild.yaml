@@ -1,7 +1,14 @@
+# cloudbuild.yaml (na raiz do repo)
 steps:
 - name: gcr.io/cloud-builders/gcloud
   entrypoint: bash
   args:
-  - -c
+  - -euxo pipefail
   - |
+      apt-get update
+      apt-get install -y jq
+      # opcional: conferir ferramentas
+      gcloud --version
+      bq version
+      # roda o seu script, passando projeto/dataset/views
       bash scripts/apply_bq.sh case-de-engenharia-de-dados 845415315315 sec_v
