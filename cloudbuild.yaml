@@ -1,19 +1,16 @@
 steps:
-- name: gcr.io/cloud-builders/gcloud
-  entrypoint: bash
-  args:
-  - -euxo
-  - pipefail
-  - -c
-  - |
-      command -v jq >/dev/null 2>&1 || {
-        curl -fsSL -o /usr/local/bin/jq \
-          https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
-        chmod +x /usr/local/bin/jq
-      }
-      ls -l && ls -l scripts && ls -l sql/views && ls -l infra/bq
-      bash scripts/apply_bq.sh "${_PROJECT}" "${_BASE_DS}" "${_VIEWS_DS}"
+  - name: gcr.io/cloud-builders/gcloud
+    entrypoint: bash
+    args:
+      - -euo
+      - pipefail
+      - -c
+      - |
+          apt-get update -y && apt-get install -y jq
+          chmod +x scripts/apply_bq.sh
+          scripts/apply_bq.sh "${_PROJECT}" "${_BASE_DS}" "${_VIEWS_DS}"
 substitutions:
   _PROJECT: case-de-engenharia-de-dados
   _BASE_DS: "845415315315"
   _VIEWS_DS: sec_v
+timeout: "1200s"
