@@ -4,6 +4,8 @@ Eu montei este projeto para gerenciar acesso no BigQuery a partir de uma tabela 
 
 ---
 
+GIT : https://github.com/dinx0/iassistant
+
 ## Como eu trago os dados (extracao/ingestao)
 
 **Fontes e formatos**
@@ -592,6 +594,532 @@ git log --oneline -n 3
 git remote -v
 ```
 
+# Case de Engenharia de Dados (BigQuery) — passo a passo final
+
+Eu construí este case inteiro no projeto **`case-de-engenharia-de-dados`** para mostrar como:
+
+* carregar bases (lote e streaming)
+* publicar **authorized views** com **mascara de dados**
+* controlar acesso somente pelas views
+* auditar leitura direta na base via **Data Access Logs** + metricas
+* monitorar atividade do **GitHub** via dataset `github_activity`
+
+Tudo aqui é o que eu realmente executei e funcionou. Sem firula.
+
+> **Regiao**: meu dataset base fica na regiao `southamerica-east1`. O dataset `github_activity` (do Marketplace) é sempre em **US**, entao as consultas nele precisam de `--location=US`.
+
+---
+
+## Visao geral (diagramas)
+
+### Arquitetura
+```mermaid
+flowchart LR
+  subgraph GCP[Projeto: case-de-engenharia-de-dados]
+    subgraph BQ[BigQuery]
+      direction TB
+      BASE[(Dataset base
+845415315315)]
+      VIEWS[(Dataset views
+sec_v)]
+      BASE -->|Authorized View| V1[view: sec_v.user_iassistant_v]
+      BASE -->|Authorized View| V2[view: sec_v.phrase_metrics_v]
+    end
+    LOGS[Cloud Logging
+(Data Access logs)]
+  end
+
+  EXT1[Chrome Ext + API
+(IASSISTANT)] -->|streaming| BASE
+  CSV[NDJSON/CSV
+usuarios] -->|load job| BASE
+
+  LOGS -.audita leitura base.-> BASE
+  LOGS -.audita leitura view.-> V1
+```
+
+### Modelo (ER simples)
+```mermaid
+erDiagram
+  USER_IASSISTANT {
+    INT64 USER_ID PK
+    STRING USER_NAME
+    STRING USER_EMAIL
+    STRING REGION "lat,lon"
+    INT64 DT_CARGA
+  }
+  PHRASE_METRICS {
+    STRING user_id FK
+    FLOAT64 PHRASE_METRICS
+    STRING PHRASE_TEXT
+    INT64 PAGE_METRICS
+    INT64 PAGE_NUMBER
+    STRING SEARCH_ITEMS
+    STRING SEARCH_RESULT
+    INT64 DT_CARGA
+  }
+  USER_IASSISTANT ||--o{ PHRASE_METRICS : "user_id = CAST(USER_ID AS STRING)"
+```
+
+### Mascaras aplicadas
+```mermaid
+flowchart TD
+  A[USER_EMAIL] -->|REGEXP_REPLACE| AM[email_mascarado
+"f***@dominio"]
+  R[REGION "lat,lon"] -->|regex + round(2)| LAT[lat_mascarada]
+  R -->|regex + round(2)| LON[lon_mascarada]
+  T[PHRASE_TEXT] -->|SUBSTR(1,20)||> three dots| TM[phrase_text_masked]
+  S[SEARCH_RESULT] -->|SUBSTR(1,60)||> three dots| SM[search_result_masked]
+```
+
+---
+
+## 1) Datasets e tabelas
+
+**Projeto**: `case-de-engenharia-de-dados`
+
+**Datasets**
+- Base: `845415315315` (regiao `southamerica-east1`)
+- Views: `sec_v` (mesma regiao do base)
+
+**Tabelas base**
+- `845415315315.user_iassistant`  
+  PK logica: `USER_ID (INT64)`
+- `845415315315.phrase_metrics`  
+  Relaciona em `user_id (STRING)` com `USER_ID` via `CAST`.
+
+**Como garanti o dataset de views na MESMA regiao do base**
+```bash
+BASE="case-de-engenharia-de-dados:845415315315"
+LOC=$(bq show --format=prettyjson "$BASE" | jq -r .location)
+bq rm -f -d case-de-engenharia-de-dados:sec_v 2>/dev/null || true
+bq mk --dataset --location="$LOC" case-de-engenharia-de-dados:sec_v
+```
+
+---
+
+## 2) Views mascaradas (DDL usado)
+
+### `sec_v.user_iassistant_v`
+```sql
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.user_iassistant_v` AS
+SELECT
+  CAST(USER_ID AS INT64) AS user_id,
+  CONCAT(
+    SUBSTR(LOWER(TRIM(USER_EMAIL)),1,1),
+    '***',
+    REGEXP_EXTRACT(LOWER(TRIM(USER_EMAIL)), r'(@.*)$')
+  ) AS email_mascarado,
+  ROUND(
+    IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>0,
+       CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(0)] AS FLOAT64), NULL),
+    2
+  ) AS lat_mascarada,
+  ROUND(
+    IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>1,
+       CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(1)] AS FLOAT64), NULL),
+    2
+  ) AS lon_mascarada
+FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`;
+```
+
+### `sec_v.phrase_metrics_v`
+```sql
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.phrase_metrics_v` AS
+SELECT
+  CAST(user_id AS STRING) AS user_id,
+  CAST(PHRASE_METRICS AS FLOAT64) AS phrase_metrics,
+  IFNULL(SUBSTR(PHRASE_TEXT, 1, 20) || '...', NULL) AS phrase_text_masked,
+  CAST(PAGE_METRICS AS INT64) AS page_metrics,
+  CAST(PAGE_NUMBER AS INT64) AS page_number,
+  SEARCH_ITEMS AS search_items,
+  IFNULL(SUBSTR(SEARCH_RESULT, 1, 60) || '...', NULL) AS search_result_masked,
+  CAST(DT_CARGA AS INT64) AS dt_carga
+FROM `case-de-engenharia-de-dados.845415315315.phrase_metrics`;
+```
+
+### Autorizar as views no dataset base
+```bash
+BASE="case-de-engenharia-de-dados:845415315315"
+
+bq show --format=prettyjson "$BASE" > base.json
+jq '.access += [
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"user_iassistant_v"}},
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"phrase_metrics_v"}}
+] | .access |= (map(tojson)|unique|map(fromjson))' base.json > base_patched.json
+bq update --source=base_patched.json "$BASE"
+```
+
+---
+
+## 3) IAM dinamico por tabela (o que eu executei)
+
+Regra: `USER_ID 1..5 => READER`, `>= 6 => WRITER` no dataset base.
+
+```bash
+PROJECT_ID="case-de-engenharia-de-dados"
+DATASET_ID="845415315315"
+DATASET_REF="$PROJECT_ID:$DATASET_ID"
+SRC_TABLE="$PROJECT_ID.$DATASET_ID.user_iassistant"
+
+bq query --nouse_legacy_sql --format=csv "
+WITH base AS (
+  SELECT DISTINCT CAST(USER_ID AS INT64) AS user_id,
+         LOWER(TRIM(USER_EMAIL)) AS email
+  FROM \`$SRC_TABLE\`
+  WHERE USER_EMAIL IS NOT NULL
+)
+SELECT email,
+       CASE WHEN user_id BETWEEN 1 AND 5 THEN 'READER' ELSE 'WRITER' END AS role
+FROM base
+" | tail -n +2 | while IFS=, read -r email role; do
+  [[ -z "$email" || -z "$role" ]] && continue
+  bq show --format=prettyjson "$DATASET_REF" > ds.tmp.json
+  jq --arg em "$email" --arg r "$role" \
+     '.access += [{"role":$r,"userByEmail":$em}] | .access |= (map(tojson)|unique|map(fromjson))' \
+     ds.tmp.json > ds.apply.json
+  bq update --source=ds.apply.json "$DATASET_REF"
+  rm -f ds.tmp.json ds.apply.json
+done
+```
+> Emails invalidos o BigQuery recusa; a lista final ficou so com emails validos.
+
+---
+
+## 4) Teste de seguranca (impersonation)
+
+Criei uma SA **somente leitora de views** e testei com impersonation.
+
+```bash
+PROJECT_ID=case-de-engenharia-de-dados
+VIEWS=case-de-engenharia-de-dados:sec_v
+BASE=case-de-engenharia-de-dados:845415315315
+
+SA=bq-viewer-demo
+EMAIL="$SA@$PROJECT_ID.iam.gserviceaccount.com"
+
+gcloud iam service-accounts create "$SA" 2>/dev/null || true
+# pode criar jobs
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$EMAIL" --role="roles/bigquery.jobUser"
+# leitura so no dataset de views
+bq update --dataset_access add:serviceAccount:$EMAIL:READER "$VIEWS"
+# garante que NAO tem acesso ao base
+bq update --dataset_access remove:serviceAccount:$EMAIL "$BASE" 2>/dev/null || true
+
+# permite eu impersonar
+MEU=$(gcloud config get-value account)
+gcloud iam service-accounts add-iam-policy-binding "$EMAIL" \
+  --member="user:$MEU" --role="roles/iam.serviceAccountTokenCreator"
+
+gcloud config set auth/impersonate_service_account "$EMAIL"
+# deve falhar
+bq query --nouse_legacy_sql 'SELECT COUNT(*) FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`' || true
+# deve funcionar
+bq query --nouse_legacy_sql 'SELECT * FROM `case-de-engenharia-de-dados.sec_v.user_iassistant_v` LIMIT 5'
+
+gcloud config unset auth/impersonate_service_account
+```
+
+---
+
+## 5) Observabilidade e controle (logs + metricas)
+
+Primeiro **habilitei Data Access logs** de BigQuery (Console > IAM e Admin > Audit Logs > BigQuery > marcar Data Read/Write).
+
+### Validar leitura direta na base (CLI)
+```bash
+gcloud logging read \
+  'logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+   AND resource.type="bigquery_dataset" \
+   AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+   AND protoPayload.metadata.tableDataRead.reason:* \
+   AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"' \
+  --limit=5 \
+  --format='value(timestamp, protoPayload.metadata.tableDataRead.reason, protoPayload.resourceName)'
+```
+
+### Metricas que eu criei
+
+**1) Leitura direta na base**
+```bash
+gcloud logging metrics create read_base_dataset_metric \
+  --description="Leituras na tabela base (bypass da view)" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_dataset" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.tableDataRead.reason:* \
+                AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"'
+```
+
+**2) Consultas que referenciam a tabela base**
+```bash
+gcloud logging metrics create query_ref_base_table_metric \
+  --description="Queries que referenciam a tabela base" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_project" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.jobCompletedEvent.job.jobStatistics.referencedTables:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"'
+```
+
+**3) Leituras via authorized view**
+```bash
+gcloud logging metrics create read_via_view_metric \
+  --description="Leituras na authorized view" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_dataset" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.tableDataRead.reason:* \
+                AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/sec_v/tables/user_iassistant_v"'
+```
+
+**4) DML na base**
+```bash
+gcloud logging metrics create base_table_dml_metric \
+  --description="Mudancas de dados na tabela base" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_dataset" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND protoPayload.metadata.tableDataChange:* \
+                AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"'
+```
+
+**5) Mudanca de schema/IAM**
+```bash
+gcloud logging metrics create base_schema_or_policy_change_metric \
+  --description="Alteracoes de schema/IAM no dataset base" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+                AND resource.type="bigquery_dataset" \
+                AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+                AND (protoPayload.metadata.tableMetadataChange:* OR protoPayload.metadata.datasetChange:*) \
+                AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315"'
+```
+
+> Em producao: configure alertas no Cloud Monitoring apontando para essas metricas (email/pager).
+
+---
+
+## 6) Qualidade de dados (checks simples que eu rodei)
+
+**Comparar contagem base vs view**
+```sql
+-- deve bater
+SELECT COUNT(*) FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`;
+SELECT COUNT(*) FROM `case-de-engenharia-de-dados.sec_v.user_iassistant_v`;
+```
+
+**Verificar mascara de email**
+```sql
+SELECT USER_EMAIL, email_mascarado
+FROM `case-de-engenharia-de-dados.845415315315.user_iassistant` u
+JOIN `case-de-engenharia-de-dados.sec_v.user_iassistant_v` v
+ON v.user_id = u.USER_ID
+LIMIT 20;
+```
+
+**Validar parse de latitude/longitude**
+```sql
+SELECT REGION, lat_mascarada, lon_mascarada
+FROM `case-de-engenharia-de-dados.sec_v.user_iassistant_v`
+WHERE (lat_mascarada IS NULL OR lon_mascarada IS NULL)
+LIMIT 20;
+```
+
+**Campos mascarados na phrase_metrics_v**
+```sql
+SELECT phrase_text_masked, search_result_masked
+FROM `case-de-engenharia-de-dados.sec_v.phrase_metrics_v`
+LIMIT 20;
+```
+
+---
+
+## 7) Monitor de atividade do GitHub (GitHub Activity Data)
+
+> Este dataset sempre fica em **US**. Se nao existir, crie o dataset manualmente:  
+> `bq --location=US mk -d case-de-engenharia-de-dados:github_activity`
+
+**Eventos por tipo (30 dias)**
+```sql
+SELECT type, COUNT(*) AS total
+FROM `case-de-engenharia-de-dados.github_activity.events`
+WHERE repo.name = 'dinx0/iassistant'
+  AND created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+GROUP BY type
+ORDER BY total DESC;
+```
+
+**Commits por dia e autor (PushEvent)**
+```sql
+SELECT
+  DATE(created_at) AS dia,
+  actor.login AS pusher,
+  COUNT(1) AS commits
+FROM `case-de-engenharia-de-dados.github_activity.events`,
+UNNEST(payload.commits) c
+WHERE repo.name = 'dinx0/iassistant'
+  AND type = 'PushEvent'
+  AND created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+GROUP BY dia, pusher
+ORDER BY dia DESC, commits DESC;
+```
+
+**Ultimos 20 commits (mensagem/autor/sha)**
+```sql
+SELECT
+  c.sha,
+  c.author.name  AS author_name,
+  c.author.email AS author_email,
+  c.message,
+  created_at
+FROM `case-de-engenharia-de-dados.github_activity.events`,
+UNNEST(payload.commits) c
+WHERE repo.name = 'dinx0/iassistant'
+  AND type = 'PushEvent'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+**PRs abertos/mergeados/fechados (90 dias)**
+```sql
+SELECT
+  COUNTIF(payload.action = 'opened')                                             AS prs_abertos,
+  COUNTIF(payload.action = 'closed' AND payload.pull_request.merged)             AS prs_mergeados,
+  COUNTIF(payload.action = 'closed' AND NOT payload.pull_request.merged)         AS prs_fechados_sem_merge
+FROM `case-de-engenharia-de-dados.github_activity.events`
+WHERE repo.name = 'dinx0/iassistant'
+  AND type = 'PullRequestEvent'
+  AND created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY);
+```
+
+**Lead time de PR (criado -> merge)**
+```sql
+SELECT
+  payload.pull_request.number AS pr_number,
+  payload.pull_request.title  AS title,
+  TIMESTAMP_DIFF(payload.pull_request.merged_at,
+                 payload.pull_request.created_at, HOUR) AS lead_time_horas
+FROM `case-de-engenharia-de-dados.github_activity.events`
+WHERE repo.name = 'dinx0/iassistant'
+  AND type = 'PullRequestEvent'
+  AND payload.action = 'closed'
+  AND payload.pull_request.merged
+ORDER BY lead_time_horas DESC
+LIMIT 20;
+```
+
+**Issues por acao**
+```sql
+SELECT payload.action, COUNT(*) AS total
+FROM `case-de-engenharia-de-dados.github_activity.events`
+WHERE repo.name = 'dinx0/iassistant'
+  AND type = 'IssuesEvent'
+GROUP BY payload.action
+ORDER BY total DESC;
+```
+
+**Stars e forks**
+```sql
+-- stars
+SELECT DATE(created_at) AS dia, COUNT(*) AS stars
+FROM `case-de-engenharia-de-dados.github_activity.events`
+WHERE repo.name = 'dinx0/iassistant' AND type = 'WatchEvent'
+GROUP BY dia ORDER BY dia DESC;
+
+-- forks
+SELECT DATE(created_at) AS dia, COUNT(*) AS forks
+FROM `case-de-engenharia-de-dados.github_activity.events`
+WHERE repo.name = 'dinx0/iassistant' AND type = 'ForkEvent'
+GROUP BY dia ORDER BY dia DESC;
+```
+
+Dica: ao usar `bq` nessas consultas, inclua `--location=US`.
+
+---
+
+## 8) Exportar e versionar infra do BigQuery no repo
+
+**Export (ambiente -> git)**
+```bash
+PROJECT=case-de-engenharia-de-dados
+BASE_DS=845415315315
+VIEWS_DS=sec_v
+mkdir -p sql/views infra/bq schema data/samples
+bq show --format=prettyjson $PROJECT:$VIEWS_DS.user_iassistant_v | jq -r .view.query > sql/views/user_iassistant_v.sql
+bq show --format=prettyjson $PROJECT:$VIEWS_DS.phrase_metrics_v  | jq -r .view.query > sql/views/phrase_metrics_v.sql
+bq show --format=prettyjson $PROJECT:$BASE_DS | jq '{access}' > infra/bq/dataset_access.json
+bq show --schema --format=prettyjson $PROJECT:$BASE_DS.user_iassistant > schema/user_iassistant.schema.json
+bq show --schema --format=prettyjson $PROJECT:$BASE_DS.phrase_metrics > schema/phrase_metrics.schema.json
+```
+
+**Apply (git -> ambiente)**
+```bash
+PROJECT=case-de-engenharia-de-dados
+BASE_DS=845415315315
+VIEWS_DS=sec_v
+BASE="$PROJECT:$BASE_DS"; VIEWS="$PROJECT:$VIEWS_DS"
+LOC=$(bq show --format=prettyjson "$BASE" | jq -r .location)
+bq mk --dataset --location="$LOC" "$VIEWS" 2>/dev/null || true
+jq '{access}' infra/bq/dataset_access.json > /tmp/ds_access.json
+bq show --format=prettyjson "$BASE" | jq '.access = (input.access)' /tmp/ds_access.json > /tmp/base_apply.json
+bq update --source=/tmp/base_apply.json "$BASE"
+bq query --use_legacy_sql=false --location="$LOC" < sql/views/user_iassistant_v.sql
+bq query --use_legacy_sql=false --location="$LOC" < sql/views/phrase_metrics_v.sql
+```
+
+**Scripts utilitarios**
+- `scripts/export_bq.sh` e `scripts/apply_bq.sh` (mesmas linhas acima em shell, prontos para automatizar).
+
+---
+
+## 9) Publicar/atualizar este README no GitHub (Cloud Shell)
+
+```bash
+# identidades do git
+git config --global user.name "Dih Oliver"
+git config --global user.email "dih.oliver08@gmail.com"
+
+# clonar (se ainda nao tiver)
+git clone https://github.com/dinx0/iassistant.git
+cd iassistant
+
+# editar README.md
+nano README.md
+
+git add README.md
+git commit -m "docs: atualiza README (BigQuery + views + logs + github activity)"
+
+# autenticar e enviar (via GitHub CLI)
+sudo apt-get update && sudo apt-get install -y gh
+gh auth login -w
+
+git branch -M main
+git push -u origin main
+```
+
+Se pedir usuario/senha via HTTPS: use **Personal Access Token** como senha, ou troque o remoto para **SSH**.
+
+---
+
+## 10) Politicas adicionais e limites do case
+
+* Ativei **Sensitive Data Protection (DLP)** no projeto para inspecao (sem bloqueios automaticos).
+* **Policy Tags/Data Policies**: deixei como melhoria futura (exige org). Mantive **authorized view** como mecanismo principal de mascaramento.
+* **Row-level Security**: tentativas com grupos nao existentes falharam; mantive apenas authorized view.
+
+---
+
+### Conclusao
+
+O case entrega:
+- mascaramento de PII na borda de consumo (views)
+- isolamento de acesso (dataset `sec_v` vs base)
+- auditoria de bypass (metricas + logs)
+- monitor de atividade do repo GitHub com queries prontas
+- scripts para exportar/aplicar infra no BigQuery e versionar no git
+
+Qualquer ajuste futuro: adicionar Policy Tags, RLS por grupo real e CI/CD via Actions/Workload Identity para aplicar as mudancas de `sql/` e `infra/` automaticamente.
+
 
 # IAssistant
 
@@ -721,5 +1249,149 @@ O **IAssistant** é uma ferramenta em Python desenvolvida para analisar conteúd
   - Funções para obter configurações dinâmicas de endpoints e dados de busca (através de GET requests para URLs configuradas).  
     **Atenção:** Por padrão, esses endpoints utilizam `http://localhost:8080`. Em produção, é necessário atualizar esse valor para um domínio público e acessível, evitando erros de conexão.
     
+# IAssistant — Case Completo de Engenharia de Dados + Extensão Chrome + Backend + BigQuery + Integração GPT
+
+Projeto criado para demonstrar, de ponta a ponta, uma solução que captura dados de buscas e documentos via extensão Chrome, processa em um backend com Spark e Python, aplica anonimização, gera métricas e dashboards interativos, e integra com múltiplos destinos de armazenamento e análise: Delta Lake (Databricks), SQL Server on-premise e BigQuery. Além disso, conecta-se à API da OpenAI para análise de contexto e geração de insights.
+
+---
+
+## Objetivo
+
+O IAssistant nasceu para integrar captura em tempo real de dados não estruturados (texto, PDFs, HTML) com processamento inteligente e visualização. É um ecossistema que combina coleta via browser, pipeline de processamento distribuído, armazenamento otimizado e análise assistida por IA, tudo conectado por APIs bem definidas.
+
+---
+
+## Arquitetura Geral
+
+```mermaid
+graph TD
+  A[Extensão Chrome] -->|POST JSON| B[/API Flask upload_api.py]
+  B -->|Processa| C[Spark - Anonimização + Validação]
+  C -->|Delta Format| D[Delta Lake - Databricks]
+  C --> E[SQL Server On-prem]
+  C --> F[Função BigQuery - GCP]
+  B --> G[Dash Server Flask/Dash]
+  G --> H[Dashboards Interativos]
+  G --> I[OpenAI GPT API]
+```
+
+---
+
+## Backend — Componentes
+
+### API de Upload (`upload_api.py`)
+
+* Recebe JSON da extensão.
+* Cria DataFrame Spark.
+* Aplica máscara em campos sensíveis (`mask_email_udf`).
+* Valida dados (ex.: contagem de linhas > 0).
+* Grava em Delta Lake e SQL Server.
+
+### Dash Server (`app.py`)
+
+* Fornece endpoints REST para servir dados e configurações.
+* Rota `/api/v1/document`: recebe documento/texto/PDF, persiste e aciona GPT.
+* Serve arquivos estáticos e integra com dashboard interativo.
+
+### Dash Process (`services/dash_process.py`)
+
+* Aguarda API subir (`http://localhost:8080/configurations`).
+* Inicia servidor Dash na porta `8081`.
+
+### Integração GPT (`client.py`)
+
+* Wrapper simples para `chat.completions` da OpenAI.
+* Parametriza temperatura (criatividade), número máximo de opções e tokens.
+
+### Função BigQuery (`bigquery_function.js`)
+
+* Recebe requisição POST.
+* Formata linha com `timestamp`, `user_id`, `search_query`, `best_answer`, `percent`.
+* Insere no dataset/tabela configurados.
+
+---
+
+## Instalação — Backend
+
+```bash
+# Clonar repositório
+cd IAssistant/backend
+
+# Criar ambiente virtual
+python -m venv .venv
+source .venv/bin/activate
+
+# Instalar dependências
+pip install -r requirements.txt
+
+# Configurar variáveis no .env
+# - OPENAI_API_KEY
+# - Config BigQuery (GCP)
+# - Config SQL Server (ODBC)
+
+# Subir API principal
+python app.py
+
+# Em outro terminal, iniciar Dash Process
+python services/dash_process.py
+```
+
+---
+
+## Instalação — Extensão Chrome
+
+1. Ir em `chrome://extensions`.
+2. Ativar **Modo do desenvolvedor**.
+3. Clicar em **Carregar sem compactação**.
+4. Selecionar pasta `IAssistant/extension`.
+5. Configurar endpoint da API no `index.html`.
+
+---
+
+## Pipeline de Processamento
+
+1. Extensão coleta dados (DOM, PDFs, inputs do usuário).
+2. Envia via `fetch` POST para `/uploadData`.
+3. Spark processa e mascara dados sensíveis.
+4. Dados persistem em:
+
+   * Delta Lake (arquitetura otimizada para queries analíticas).
+   * SQL Server (uso interno/on-prem).
+   * BigQuery (análises agregadas e cruzamento com outros datasets).
+5. API dispara análise GPT e retorna sugestões/insights.
+6. Dashboards consomem dados processados.
+
+---
+
+## Similaridade e Estatística
+
+* **Tokenização e vetorização**: textos quebrados em tokens, aplicando limpeza (stopwords, stemming) para comparação.
+* **Métrica de similaridade**: cálculo de similaridade semântica entre campos (cosine similarity sobre embeddings ou TF-IDF dependendo do caso).
+* **Estatística descritiva**: contagem, médias, percentuais, distribuição de termos.
+* **Validação**: regras simples (mínimo de linhas, campos obrigatórios) e logs estruturados.
+
+---
+
+## Bibliotecas Utilizadas
+
+* **Backend**: Flask, Flask-CORS, PyODBC, Pyspark, Dash, Dash Bootstrap Components.
+* **Integração GPT**: openai.
+* **GCP**: @google-cloud/bigquery (Node.js).
+* **Outros**: logging, json, base64, urllib.
+
+---
+
+## Fluxo de Inserção no BigQuery
+
+1. Extensão ou backend envia JSON para endpoint da função.
+2. Função Node.js formata linha conforme schema.
+3. Executa `table.insert()` no BigQuery.
+4. Registro disponível quase em tempo real para consulta via SQL.
+
+---
+
+## Resultado
+
+Com essa arquitetura, conseguimos ingerir, processar, anonimizar e disponibilizar dados não estruturados de forma escalável, com integração entre ambiente on-prem e cloud, além de análise contextual via GPT e visualização imediata em dashboards.
 
 
