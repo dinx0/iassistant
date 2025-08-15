@@ -1394,4 +1394,625 @@ python services/dash_process.py
 
 Com essa arquitetura, conseguimos ingerir, processar, anonimizar e disponibilizar dados não estruturados de forma escalável, com integração entre ambiente on-prem e cloud, além de análise contextual via GPT e visualização imediata em dashboards.
 
+Case de Engenharia de Dados + IAssistant (Extensão + Backend + BigQuery)
 
+Eu montei este case unificando a extensão IAssistant com um backend analítico e um projeto BigQuery governado via authorized views. Ideia simples: capturo consulta + conteúdo (PDF/HTML/TXT/CSV), tokenizo, calculo TF-IDF + cosseno por frase/página, mostro gráficos no Dash e persiste no BigQuery (com máscaras e auditoria).
+
+Projeto GCP: case-de-engenharia-de-dados
+Região base: southamerica-east1
+Dataset Marketplace github_activity: sempre em US → consultas com --location=US.
+
+Canvas 1 — Arquitetura (fim-a-fim)
+flowchart LR
+  subgraph Browser[Chrome]
+    EXT[Extensão IAssistant\npopup/side-panel/omnibox]
+  end
+
+  EXT -- POST /api/v1/document --> API8080[API Core (Flask)\n8080 (dash_server.py)]
+  EXT -- POST /uploadData --> API5000[Upload API (Flask+Spark)\n5000 (api_uploader.py)]
+
+  API8080 --> DASH[Dash 8081\n(dash_process.py + IAUtils.start_server())]
+  API8080 -- opcional --> GPT[OpenAI client.py]
+
+  API5000 -- insert --> BQ[(BigQuery\niaassistant.logs/pages/terms)]
+  API5000 -- append --> DELTA[(Delta Lake/DBFS)]
+  API5000 -- mirror --> SQL[(SQL Server on-prem)]
+
+  subgraph GCP[Projeto: case-de-engenharia-de-dados]
+    subgraph BQSEC[BigQuery Governança]
+      direction TB
+      BASE[(Dataset base\n845415315315)]
+      VIEWS[(Dataset views\nsec_v)]
+      BASE -->|Authorized View| V1[sec_v.user_iassistant_v]
+      BASE -->|Authorized View| V2[sec_v.phrase_metrics_v]
+    end
+    LOGS[Cloud Logging\n(Data Access Logs)]
+  end
+
+  CSV[NDJSON/CSV usuarios] -->|load job| BASE
+  LOGS -.audita leitura base.-> BASE
+  LOGS -.audita leitura view.-> V1
+
+
+Padrão de dados que usei
+
+Kappa-like por padrão: um único caminho de eventos (extensão → APIs) atende realtime + replay.
+
+Lambda on-demand: quando preciso de lotes massivos, rodo batch e converjo no BigQuery. Operação simples.
+
+Canvas 2 — Pipeline analítico (tokenização/TF-IDF/cosseno)
+flowchart LR
+  Q[Consulta] --> N[Normalização\nlower/regex]
+  D[Documento (PDF/HTML/TXT/CSV)] --> N
+  N --> T[Tokenização + stopwords (NLTK)]
+  T --> V[TF-IDF]
+  Q --> V
+  V --> S[Cosine por frase/trecho]
+  S --> A[Agregação por página (PDF)]
+  S --> F[FreqDist tokens]
+  A --> G1[Gráfico by_page]
+  F --> G2[Gráfico top_words]
+  S --> G3[Tabela frases (score)]
+
+
+Como calculei
+
+Normalização: minúsculas, remoção de pontuação/ruído com regex.
+
+Split: PDF por página (PyMuPDF) + frase (NLTK). HTML/TXT idem (frase/bloco).
+
+TF-IDF: 
+t
+f
+i
+d
+f
+(
+𝑡
+,
+𝑑
+)
+=
+t
+f
+(
+𝑡
+,
+𝑑
+)
+⋅
+log
+⁡
+𝑁
+𝑑
+𝑓
+(
+𝑡
+)
+tfidf(t,d)=tf(t,d)⋅log
+df(t)
+N
+	​
+
+
+Cosseno: 
+cos
+⁡
+(
+𝜃
+)
+=
+𝑞
+⃗
+⋅
+𝑑
+⃗
+∥
+𝑞
+⃗
+∥
+⋅
+∥
+𝑑
+⃗
+∥
+cos(θ)=
+∥
+q
+	​
+
+∥⋅∥
+d
+∥
+q
+	​
+
+⋅
+d
+	​
+
+
+page_metric_by_page: média/percentil dos scores das frases daquela página.
+
+tokens_top: FreqDist (termo, frequência, páginas).
+
+Thresholds (ex.: 0.15) para realce visual.
+
+Canvas 3 — Modelo (ER) unificado
+erDiagram
+  LOGS {
+    TIMESTAMP ts
+    STRING page_url
+    STRING query
+    STRING lang
+    STRING source_type
+    STRING source_url
+    STRING client_version
+    STRING user_id
+  }
+  PAGES {
+    TIMESTAMP ts
+    STRING doc_id
+    INT64 page_number
+    FLOAT64 page_metric_by_page
+  }
+  TERMS {
+    TIMESTAMP ts
+    STRING doc_id
+    STRING token
+    INT64 frequency
+    ARRAY<INT64> pages
+  }
+  USER_IASSISTANT {
+    INT64 USER_ID PK
+    STRING USER_NAME
+    STRING USER_EMAIL
+    STRING REGION "lat,lon"
+    INT64  DT_CARGA
+  }
+  PHRASE_METRICS {
+    STRING  user_id FK
+    FLOAT64 PHRASE_METRICS
+    STRING  PHRASE_TEXT
+    INT64   PAGE_METRICS
+    INT64   PAGE_NUMBER
+    STRING  SEARCH_ITEMS
+    STRING  SEARCH_RESULT
+    INT64   DT_CARGA
+  }
+  USER_IASSISTANT ||--o{ PHRASE_METRICS : "user_id = CAST(USER_ID AS STRING)"
+
+Instalação rápida
+
+Backend (Python 3.9+)
+
+cd IAssistant/backend
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+source .venv/bin/activate
+pip install -r requirements.txt
+python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords')"
+
+
+Crie .env (a partir do .env.example) e ajuste:
+
+API_CORE_HOST=0.0.0.0
+API_CORE_PORT=8080
+DASH_HOST=0.0.0.0
+DASH_PORT=8081
+CORS_ALLOWED_ORIGINS=*
+
+BQ_ENABLED=true
+BQ_PROJECT_ID=case-de-engenharia-de-dados
+BQ_DATASET=iaassistant
+BQ_TABLE_LOGS=logs
+BQ_TABLE_PAGES=pages
+BQ_TABLE_TERMS=terms
+GOOGLE_APPLICATION_CREDENTIALS=/abs/path/service-account.json
+
+DELTA_ENABLED=false
+DELTA_OUTPUT_PATH=dbfs:/mnt/extension_data/processed/
+
+SQL_ENABLED=false
+SQL_SERVER=YOUR_SQL_SERVER_ADDRESS
+SQL_DATABASE=YOUR_DATABASE_NAME
+SQL_USERNAME=YOUR_USERNAME
+SQL_PASSWORD=YOUR_PASSWORD
+SQL_TABLE=ExtensionData
+
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_AGENT_ID=
+OPENAI_INSTRUCTIONS="Responda com até {0} opções claras..."
+
+
+Suba os serviços (2 terminais):
+
+python dash_server.py            # porta 8080
+python services/dash_process.py  # porta 8081
+
+
+Extensão (Chrome)
+
+chrome://extensions → Modo dev → Carregar sem compactação → IAssistant/extension.
+
+Em index.html, ajuste:
+
+<script>
+  const defaultConfig = {
+    API_METRICS_URL: "http://localhost:8080/api/metrics",
+    API_GRAPHICS_URL: "http://localhost:8080/graphics",
+    API_UPLOAD_URL:  "http://localhost:5000/uploadData",
+    API_GPT_URL:     "http://localhost:8080/gpt/complete"
+  };
+</script>
+
+
+BigQuery (dataset analítico IAssistant)
+
+CREATE SCHEMA IF NOT EXISTS `case-de-engenharia-de-dados.iaassistant`;
+
+CREATE TABLE IF NOT EXISTS `case-de-engenharia-de-dados.iaassistant.logs` (
+  ts TIMESTAMP, page_url STRING, query STRING, lang STRING,
+  source_type STRING, source_url STRING, client_version STRING, user_id STRING
+);
+
+CREATE TABLE IF NOT EXISTS `case-de-engenharia-de-dados.iaassistant.pages` (
+  ts TIMESTAMP, doc_id STRING, page_number INT64, page_metric_by_page FLOAT64
+);
+
+CREATE TABLE IF NOT EXISTS `case-de-engenharia-de-dados.iaassistant.terms` (
+  ts TIMESTAMP, doc_id STRING, token STRING, frequency INT64, pages ARRAY<INT64>
+);
+
+
+BigQuery (case governança: base + views)
+
+BASE="case-de-engenharia-de-dados:845415315315"
+LOC=$(bq show --format=prettyjson "$BASE" | jq -r .location)
+bq rm -f -d case-de-engenharia-de-dados:sec_v 2>/dev/null || true
+bq mk --dataset --location="$LOC" case-de-engenharia-de-dados:sec_v
+
+
+Views com máscara:
+
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.user_iassistant_v` AS
+SELECT
+  CAST(USER_ID AS INT64) AS user_id,
+  CONCAT(SUBSTR(LOWER(TRIM(USER_EMAIL)),1,1),'***',
+         REGEXP_EXTRACT(LOWER(TRIM(USER_EMAIL)), r'(@.*)$')) AS email_mascarado,
+  ROUND(
+    IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>0,
+       CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(0)] AS FLOAT64), NULL), 2
+  ) AS lat_mascarada,
+  ROUND(
+    IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>1,
+       CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(1)] AS FLOAT64), NULL), 2
+  ) AS lon_mascarada
+FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`;
+
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.phrase_metrics_v` AS
+SELECT
+  CAST(user_id AS STRING) AS user_id,
+  CAST(PHRASE_METRICS AS FLOAT64) AS phrase_metrics,
+  IFNULL(SUBSTR(PHRASE_TEXT, 1, 20) || '...', NULL) AS phrase_text_masked,
+  CAST(PAGE_METRICS AS INT64) AS page_metrics,
+  CAST(PAGE_NUMBER AS INT64) AS page_number,
+  SEARCH_ITEMS AS search_items,
+  IFNULL(SUBSTR(SEARCH_RESULT, 1, 60) || '...', NULL) AS search_result_masked,
+  CAST(DT_CARGA AS INT64) AS dt_carga
+FROM `case-de-engenharia-de-dados.845415315315.phrase_metrics`;
+
+
+Autorizar as views no dataset base:
+
+bq show --format=prettyjson "$BASE" > base.json
+jq '.access += [
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"user_iassistant_v"}},
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"phrase_metrics_v"}}
+] | .access |= (map(tojson)|unique|map(fromjson))' base.json > base_patched.json
+bq update --source=base_patched.json "$BASE"
+
+Canvas 4 — Scripts (copy-paste)
+
+Cada bloco abaixo é um canvas de script com o arquivo inteiro. Copie o que precisar.
+
+->  backend/dash_server.py
+from IAUtils import IAssistantRequests,IAssistantRuntimeData
+from flask import Flask
+from flask import redirect, request
+from urllib import parse
+from flask_cors import CORS
+from client import sendQuestionGenIA
+import init_dash_servers
+import os, base64, urllib, time
+from flask import send_file
+
+diretorio_atual = os.path.dirname(os.path.abspath(__file__))
+pasta_static = os.path.join(diretorio_atual, 'static')
+os.makedirs(pasta_static, exist_ok=True)
+
+runtime_data = IAssistantRuntimeData()
+ia_download_manager = IAssistantRequests()
+
+def start_api_server():
+    app_core = Flask(__name__)
+    CORS(app_core, origins='*', allow_headers='*')
+
+    @app_core.route('/')
+    def index():
+        caminho_index = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'index.html'))
+        return send_file(caminho_index)
+
+    @app_core.route('/graphics')
+    def send_file_graphics():
+        return redirect("http://localhost:8081/index.html")
+
+    @app_core.route('/configurations')
+    def get_configurations():
+        import json
+        url_tmp  = urllib.parse.quote(runtime_data.current_url)
+        return json.dumps({'url': url_tmp}), 200
+
+    @app_core.route('/search/options')
+    def get_input_data():
+        import json
+        return json.dumps(runtime_data.current_inputs), 200
+
+    @app_core.route('/api/v1/document', methods=['POST'])
+    def create_document():
+        data = request.json
+        inputSearch = parse.unquote(base64.b64decode(data["inputSearchTarget"]))
+        listOptionsGenIA = data['listOptionsGenIA']
+        typ = data["type"]
+        runtime_data.current_site_url = data['url']
+
+        if typ=='text':
+          contentDocument = parse.unquote(base64.b64decode(data["contentText"]).decode('utf-8'))
+          binary_content = parse.unquote(base64.b64decode(data["BinaryContent"]).decode('utf-8'))
+          runtime_data.current_url = ia_download_manager.save_text_file_binary_content(
+              content=binary_content, filename='ia_html_binary_file_output', code_content_to_filename=0)
+        elif typ=='pdf':
+          binary_content = base64.b64decode(data['BinaryContent'])
+          contentDocument = parse.unquote(base64.b64decode(data["pdf"]).decode('utf-8'))
+          runtime_data.current_url = ia_download_manager.save_pdf_file_binary_content(content=binary_content)
+
+        output = sendQuestionGenIA(inputSearch, contentDocument,
+                                   number_response_options=listOptionsGenIA, creativity_degree=1.5)
+
+        runtime_data.current_inputs = {
+          'inputSearchTarget': inputSearch,
+          'search_options': output,
+          'tabId': data['tabId'],
+          'listOptionsGenIA': listOptionsGenIA,
+          'doc': contentDocument,
+          'url': runtime_data.current_site_url
+        }
+
+        init_dash_servers.init_dashboard_services()
+        time.sleep(15)
+        return "output.html", 201
+
+    return app_core
+
+if __name__ == '__main__':
+   app = start_api_server()
+   app.run(port=8080,host='0.0.0.0', debug=True)
+
+-> backend/services/dash_process.py
+import IAUtils, time, requests
+from IAUtils import start_server
+
+for i in range(10):
+    try:
+        requests.get("http://localhost:8080/configurations", timeout=1)
+        break
+    except requests.exceptions.RequestException:
+        print(f"Aguardando API (tentativa {i+1}/10)...")
+        time.sleep(1)
+else:
+    raise RuntimeError("API nunca ficou disponível. Abortando dashboard.")
+
+app_dash = start_server()
+app_dash.run(port=8081, host="0.0.0.0")
+
+-> backend/client.py (OpenAI opcional)
+from openai import OpenAI
+from dotenv import load_dotenv
+import os
+load_dotenv()
+
+def sendQuestionGenIA(message,inputDocument,number_response_options,creativity_degree):
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    completion = client.chat.completions.create(
+        max_tokens=1200,
+        model=os.getenv("OPENAI_MODEL"),
+        temperature=creativity_degree,
+        messages=[
+          {"role": "system", "content": os.getenv("OPENAI_INSTRUCTIONS").format(number_response_options)},
+          {"role": "user", "content": message}
+        ]
+    )
+    return completion.choices[0].message.content
+
+if __name__=="__main__":
+    print("="*20,"\nLoaded IAssistant Module!!!\n","="*20)
+
+-> backend/api_uploader.py (Spark/Delta + SQL)
+from flask import Flask, request, jsonify
+import logging, json, pyodbc
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, udf
+from pyspark.sql.types import StringType
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+app = Flask(__name__)
+
+spark = SparkSession.builder.appName("ChromeExtensionUploader").getOrCreate()
+
+def mask_email(email):
+    if email and "@" in email:
+        parts = email.split("@")
+        return parts[0][:2] + "*" * max(len(parts[0])-2,0) + "@" + parts[1]
+    return email
+
+mask_email_udf = udf(mask_email, StringType())
+
+def update_on_premise_sql(data):
+    try:
+        connection_string = (
+            "Driver={ODBC Driver 17 for SQL Server};"
+            "Server=YOUR_SQL_SERVER_ADDRESS;"
+            "Database=YOUR_DATABASE_NAME;"
+            "UID=YOUR_USERNAME;"
+            "PWD=YOUR_PASSWORD;"
+        )
+        cnxn = pyodbc.connect(connection_string)
+        cursor = cnxn.cursor()
+        cursor.execute("INSERT INTO ExtensionData (data_json) VALUES (?)", json.dumps(data))
+        cnxn.commit(); cursor.close(); cnxn.close()
+        logger.info("Dados inseridos no SQL on premise.")
+    except Exception as e:
+        logger.error("Erro ao atualizar SQL on premise: %s", str(e))
+        raise e
+
+@app.route("/uploadData", methods=["POST"])
+def upload_data():
+    try:
+        content = request.get_json()
+        logger.info("Dados recebidos: %s", content)
+        df = spark.createDataFrame([content])
+        if "email" in df.columns:
+            df = df.withColumn("email_masked", mask_email_udf(col("email"))).drop("email")
+        if df.count() < 1:
+            return jsonify({"status":"error","message":"Nenhum dado recebido!"}), 400
+        df.write.format("delta").mode("append").save("dbfs:/mnt/extension_data/processed/")
+        update_on_premise_sql(content)
+        return jsonify({"status":"success","message":"Dados recebidos e processados."}), 200
+    except Exception as e:
+        logger.error("Erro ao processar: %s", str(e))
+        return jsonify({"status":"error","message":str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
+- > backend/bigquery_function.js (HTTP → BigQuery)
+const { BigQuery } = require('@google-cloud/bigquery');
+const bigquery = new BigQuery();
+
+const datasetId = 'case-de-engenharia-de-dados';
+const tableId = 'search_iassistent';
+
+exports.insertSearchData = async (req, res) => {
+  if (req.method !== 'POST') { res.status(405).send('Method Not Allowed'); return; }
+  try {
+    const body = req.body;
+    if (!body.timestamp) body.timestamp = new Date().toISOString();
+
+    const row = {
+      timestamp: body.timestamp,
+      user_id: body.user_id,
+      search_query: body.search_query,
+      best_answer: body.best_answer,
+      percent: body.percent || null
+    };
+
+    await bigquery.dataset(datasetId).table(tableId).insert([row]);
+    res.status(200).send('Data inserted successfully!');
+  } catch (err) {
+    console.error('Error inserting data: ', err);
+    res.status(500).send('Error inserting data.');
+  }
+};
+
+Canvas 5 — Auditoria (Data Access Logs) e IAM
+
+Habilite Data Access Logs (Console > IAM e Admin > Audit Logs > BigQuery > Data Read/Write).
+
+Checagens rápidas:
+
+# leitura direta na base
+gcloud logging read \
+  'logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" \
+   AND resource.type="bigquery_dataset" \
+   AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" \
+   AND protoPayload.metadata.tableDataRead.reason:* \
+   AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"' \
+  --limit=5 \
+  --format='value(timestamp, protoPayload.metadata.tableDataRead.reason, protoPayload.resourceName)'
+
+
+Métricas que criei:
+
+# leituras na base
+gcloud logging metrics create read_base_dataset_metric \
+  --description="Leituras na tabela base (bypass da view)" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" AND resource.type="bigquery_dataset" AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" AND protoPayload.metadata.tableDataRead.reason:* AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"'
+
+# queries referenciando a base
+gcloud logging metrics create query_ref_base_table_metric \
+  --description="Queries que referenciam a tabela base" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" AND resource.type="bigquery_project" AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" AND protoPayload.metadata.jobCompletedEvent.job.jobStatistics.referencedTables:"projects/case-de-engenharia-de-dados/datasets/845415315315/tables/user_iassistant"'
+
+# leituras via view
+gcloud logging metrics create read_via_view_metric \
+  --description="Leituras na authorized view" \
+  --log-filter='logName="projects/case-de-engenharia-de-dados/logs/cloudaudit.googleapis.com%2Fdata_access" AND resource.type="bigquery_dataset" AND protoPayload.metadata."@type"="type.googleapis.com/google.cloud.audit.BigQueryAuditMetadata" AND protoPayload.metadata.tableDataRead.reason:* AND protoPayload.resourceName:"projects/case-de-engenharia-de-dados/datasets/sec_v/tables/user_iassistant_v"'
+
+
+IAM dinâmico por dataset (exemplo):
+
+PROJECT_ID="case-de-engenharia-de-dados"
+DATASET_ID="845415315315"
+DATASET_REF="$PROJECT_ID:$DATASET_ID"
+SRC_TABLE="$PROJECT_ID.$DATASET_ID.user_iassistant"
+
+bq query --nouse_legacy_sql --format=csv "
+WITH base AS (
+  SELECT DISTINCT CAST(USER_ID AS INT64) AS user_id,
+         LOWER(TRIM(USER_EMAIL)) AS email
+  FROM \`$SRC_TABLE\`
+  WHERE USER_EMAIL IS NOT NULL
+)
+SELECT email,
+       CASE WHEN user_id BETWEEN 1 AND 5 THEN 'READER' ELSE 'WRITER' END AS role
+FROM base
+" | tail -n +2 | while IFS=, read -r email role; do
+  [[ -z "$email" || -z "$role" ]] && continue
+  bq show --format=prettyjson "$DATASET_REF" > ds.tmp.json
+  jq --arg em "$email" --arg r "$role" \
+     '.access += [{"role":$r,"userByEmail":$em}] | .access |= (map(tojson)|unique|map(fromjson))' \
+     ds.tmp.json > ds.apply.json
+  bq update --source=ds.apply.json "$DATASET_REF"
+  rm -f ds.tmp.json ds.apply.json
+done
+
+Consultas úteis (BigQuery)
+-- páginas mais “quentes” por relevância (IAssistant)
+SELECT *
+FROM `case-de-engenharia-de-dados.iaassistant.pages`
+WHERE page_number > 2 AND page_metric_by_page < 0.25
+ORDER BY ts DESC;
+
+-- top tokens por documento (IAssistant)
+SELECT doc_id, token, SUM(frequency) AS freq
+FROM `case-de-engenharia-de-dados.iaassistant.terms`
+GROUP BY doc_id, token
+ORDER BY freq DESC
+LIMIT 50;
+
+-- auditoria de origens (IAssistant)
+SELECT page_url, COUNT(*) AS hits
+FROM `case-de-engenharia-de-dados.iaassistant.logs`
+GROUP BY page_url
+ORDER BY hits DESC
+LIMIT 100;
+
+Notas finais
+
+Extensão manda contexto; APIs processam e persistem; Dash explica; BigQuery governa.
+
+Máscaras nas views, Data Access Logs para auditoria, e métricas para sinalizar bypass.
+
+OpenAI aqui é para resumo/rotulagem, não decide ranking (o ranking é matemático e auditável).
