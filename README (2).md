@@ -86,6 +86,314 @@ Nota: emails ficticios/inexistentes o BigQuery recusa (nao entram na policy).
 
 ---
 
+# IAassistant — Operação, IA primeiro, Dados e Infra
+
+> Eu (IASSISTANT) documentando o projeto end-to-end: arquitetura de IA (RAG/embeddings), renderização, formato/qualidade dos dados, tempo & ROI, instalação, troubleshooting e infraestrutura (Docker + Terraform). Para o dicionário completo de dados, acesse **README_DATA_DICTIONARY.md**.
+
+---
+
+## 1) IA primeiro (arquitetura lógica)
+
+**Pipeline de resposta:**
+
+1. **Ingestão** de documentos/eventos
+2. **Limpeza** + **chunking** (200–500 tokens, overlap 40–80)
+3. **Embeddings** (dim. 768/1536) → **Índice semântico**
+4. **RAG** (Retriever-Augmented Generation) — top-k 3–5 + re-rank opcional
+5. **Geração** com LLM (temperature baixo em produção)
+6. **Telemetria** → BigQuery `IASSISTANT_RESULTS`
+
+**Modelos**: LLM configurável por env (OpenAI/Vertex/…), embeddings idem.
+
+**Prompt**: role + plano de resposta + fonte; com RAG, retornar citações quando obrigatório.
+
+---
+
+## 2) Vetorização
+
+- Normalizo fontes (HTML/PDF → texto canônico).
+- **Embeddings** gerados em lote (Airflow) e sob demanda (webhook).
+- Índice (FAISS/serviço gerenciado) persistente em volume Docker (`data_vectors`) ou serviço externo.
+
+---
+
+## 3) Renderização (API + Dashboard)
+
+- **API** (`/ask`) executa RAG + LLM e retorna `{answer, sources, latency_ms, tokens, model}`.
+- **Dashboard (Dash)** em `:8081` com volume, latência, erros, score.
+
+---
+
+## 4) Formato dos dados (BigQuery)
+
+- Projeto: `case-de-engenharia-de-dados`
+- Região: **southamerica-east1**
+- **Dataset fonte de verdade**: `845415315315`  
+  (Opcional: dataset *amigável* `iassistant` com **views** para as tabelas da fonte)
+
+Tabelas:
+
+- **`845415315315.IASSISTANT_RESULTS`** — métricas/telemetria da IA (particionado por hora)
+- **`845415315315.user_iassistant`** — dados de usuários anônimos (particionado por hora)
+
+> O dicionário completo e os DDL/Views estão em **README_DATA_DICTIONARY.md**.
+
+---
+
+## 5) Qualidade dos dados
+
+- Validação de schema/tipos, PII mascarado, `DT_CARGA` registrado.
+- Contagens e TTL verificadas após cada deploy (consultas prontas no README de dicionário).
+
+---
+
+## 6) Tempo & ROI
+
+- Boot stack (local + cloud): ~30–60 min
+- Vetorização inicial: depende do corpus (100k docs → horas com paralelismo)
+- ROI típico:
+
+Redução de atendimento/search: 30–50% (experiência realista)
+
+---
+
+## 7) Instalação (Windows + PowerShell)
+
+### 7.1 Fixar projeto e região
+
+```powershell
+gcloud config set project case-de-engenharia-de-dados
+$env:BIGQUERY_LOCATION = 'southamerica-east1'
+
+7.2 Validar dataset/tabelas (fonte de verdade)
+
+
+bq --location=southamerica-east1 show case-de-engenharia-de-dados:845415315315.IASSISTANT_RESULTS
+bq --location=southamerica-east1 show case-de-engenharia-de-dados:845415315315.user_iassistant
+
+
+7.3 Contagens rápidas
+
+bq --location=southamerica-east1 query --use_legacy_sql=false `
+"SELECT 'IASSISTANT_RESULTS' AS tbl, COUNT(*) AS rows
+   FROM \`case-de-engenharia-de-dados.845415315315.IASSISTANT_RESULTS\`
+ UNION ALL
+ SELECT 'user_iassistant', COUNT(*)
+   FROM \`case-de-engenharia-de-dados.845415315315.user_iassistant\`"
+
+
+7.4 (Opcional) dataset “amigável” com views
+
+-- crie dataset nomeado
+bq --location=southamerica-east1 mk -d iassistant;
+
+-- views (rode no Console do BigQuery)
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.iassistant.IASSISTANT_RESULTS` AS
+SELECT * FROM `case-de-engenharia-de-dados.845415315315.IASSISTANT_RESULTS`;
+
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.iassistant.user_iassistant` AS
+SELECT * FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`;
+
+
+
+7.5 Subir serviços (Docker Compose)
+
+# docker-compose.yml (simplificado)
+version: "3.8"
+
+services:
+  api:
+    build: ./backend
+    command: ["python", "dash_process.py"]
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - data_api:/app/data   # persiste dados locais da API
+
+  dash:
+    build: ./backend
+    command: ["python", "dash_server.py"]
+    ports:
+      - "8081:8081"
+    env_file:
+      - .env
+    depends_on:
+      - api
+    volumes:
+      - ./backend:/app
+      - data_dash:/app/data
+
+  # Exemplo de index de embeddings local (opcional)
+  vectorstore:
+    image: ghcr.io/your/faiss:latest
+    volumes:
+      - data_vectors:/var/lib/vectors
+
+volumes:
+  data_api:
+  data_dash:
+  data_vectors:
+
+
+8) Operação diária
+
+Perguntas e respostas: /ask (API) faz RAG + LLM.
+
+Telemetria: cada call registra métricas em IASSISTANT_RESULTS.
+
+Painel: http://localhost:8081
+ (latência, volume, erros, notas).
+
+
+9) Troubleshooting (o que realmente aconteceu)
+
+Dataset errado: consultas no iassistant (que não existia) geravam not found.
+✅ Corrigido: a fonte de verdade é o dataset numérico 845415315315.
+
+Location errada: US vs southamerica-east1 — causa not found mesmo existindo.
+✅ Fix: sempre passo --location=southamerica-east1 e seto $env:BIGQUERY_LOCATION.
+
+TTL: tabelas tinham TTL de 60 dias.
+➜ Pode ser removido com bq update --expiration 0 <tabela> se quiser retenção longa.
+
+10) Backups/snapshots (GCS)
+Export diário (Parquet)
+
+
+$bucket = 'dadosinteligenciaassistant'
+$prefix = 'backup/' + (Get-Date -Format 'yyyyMMdd_HHmmss')
+
+bq --location=southamerica-east1 extract --destination_format=PARQUET `
+  case-de-engenharia-de-dados:845415315315.IASSISTANT_RESULTS `
+  gs://$bucket/$prefix/IASSISTANT_RESULTS/*.parquet
+
+bq --location=southamerica-east1 extract --destination_format=PARQUET `
+  case-de-engenharia-de-dados:845415315315.user_iassistant `
+  gs://$bucket/$prefix/user_iassistant/*.parquet
+
+
+bq --location=southamerica-east1 load --replace --source_format=PARQUET `
+  case-de-engenharia-de-dados:iassistant.IASSISTANT_RESULTS `
+  gs://dadosinteligenciaassistant/backup/202509__/IASSISTANT_RESULTS/*.parquet
+
+bq --location=southamerica-east1 load --replace --source_format=PARQUET `
+  case-de-engenharia-de-dados:iassistant.user_iassistant `
+  gs://dadosinteligenciaassistant/backup/202509__/user_iassistant/*.parquet
+
+
+11) Terraform (infra BigQuery + GCS mínimo)
+
+Obs.: trechos simplificados; ajuste providers/credentials conforme seu fluxo.
+
+
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "google" {
+  project = "case-de-engenharia-de-dados"
+  region  = "southamerica-east1"
+}
+
+resource "google_bigquery_dataset" "iassistant" {
+  dataset_id                  = "iassistant"
+  location                    = "southamerica-east1"
+  default_table_expiration_ms = 0
+}
+
+resource "google_storage_bucket" "snapshots" {
+  name                        = "dadosinteligenciaassistant"
+  location                    = "US" # bucket global; escolha sua região
+  force_destroy               = true
+  uniform_bucket_level_access = true
+}
+
+12) Docker “Yammy” (yaml) com dados persistentes
+
+Volumes nomeados (data_*) para API, Dash e índice vetorial.
+
+Não há dados do BigQuery no container; a persistência real analítica fica no BQ.
+
+Se usar um Postgres/MinIO locais, monte volumes:
+
+
+postgres:
+  image: postgres:15
+  environment:
+    - POSTGRES_PASSWORD=secret
+  volumes:
+    - pgdata:/var/lib/postgresql/data
+minio:
+  image: minio/minio
+  command: server /data
+  volumes:
+    - minio_data:/data
+
+volumes:
+  pgdata:
+  minio_data:
+
+
+13) Queries e logs que usei (referência)
+13.1 Contagens (já no topo)
+
+SELECT 'IASSISTANT_RESULTS' AS tbl, COUNT(*) AS rows
+FROM `case-de-engenharia-de-dados.845415315315.IASSISTANT_RESULTS`
+UNION ALL
+SELECT 'user_iassistant', COUNT(*)
+FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`;
+
+
+
+13.2 Mostrar metadados
+
+bq --location=southamerica-east1 update --expiration 0 \
+  case-de-engenharia-de-dados:845415315315.IASSISTANT_RESULTS
+
+bq --location=southamerica-east1 update --expiration 0 \
+  case-de-engenharia-de-dados:845415315315.user_iassistant
+
+
+14) Fluxo de commit e autoria
+
+Atualizar README.md (este arquivo) no repositório.
+
+Commit:
+
+git add README.md docker-compose.yml terraform/*
+git commit -m "docs: README completo + persistência + terraform | author: IASSISTANT"
+git push origin main
+
+
+Criar outro repositório “limpo” (sem fork):
+
+No GitHub, New repository → iassistant (ou o nome que preferir).
+
+Local:
+
+
+git clone https://github.com/<seu-usuario>/iassistant
+rsync -av --exclude .git ./repo_atual/ ./iassistant/
+cd iassistant
+git add .
+git commit -m "first commit by IASSISTANT"
+git push -u origin main
+
+
+
+
+
+
+
 ## Views mascaradas (SQL que eu apliquei)
 
 ### `sec_v.user_iassistant_v`
