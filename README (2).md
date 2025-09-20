@@ -49,6 +49,55 @@ GIT : https://github.com/dinx0/iassistant
 
 ---
 
+
+---
+
+## Arquivo 2 — `README_DATA_DICTIONARY.md`
+
+```markdown
+# Dicionário de Dados — IAassistant
+
+> Dataset fonte de verdade: `case-de-engenharia-de-dados.845415315315` (região `southamerica-east1`).
+
+---
+
+## 1) Tabela: 845415315315.IASSISTANT_RESULTS
+
+| Campo            | Tipo    | Nulo | Descrição                                                             | Exemplo                    |
+|------------------|---------|------|-----------------------------------------------------------------------|----------------------------|
+| PHRASE_TEXT      | STRING  | SIM  | Consulta/frase do usuário                                             | "como subir docker?"       |
+| DT_CARGA         | INT64   | NÃO  | Timestamp de carga (epoch)                                            | 1727368685                 |
+| PAGE_METRICS     | FLOAT64 | SIM  | Métrica de página (se aplicável)                                      | 0.82                       |
+| SEARCH_ITEMS     | STRING  | SIM  | Itens/IDs consultados                                                 | "doc:123;doc:456"          |
+| PAGE_NUMBER      | INT64   | SIM  | Página de resultado                                                   | 1                          |
+| SEARCH_RESULT    | STRING  | SIM  | Tipo/resultado                                                         | "RAG"                      |
+| PHRASE_METRICS   | FLOAT64 | SIM  | Score semântico                                                        | 0.94                       |
+| USER_ID          | INT64   | SIM  | ID de usuário interno (mascarar se PII)                               | 751                        |
+
+**Particionamento**: por **hora** (`TIMESTAMP`)  
+**TTL padrão**: 60 dias (removível com `bq update --expiration 0 ...`)  
+**Clustering**: opcional por (`USER_ID`, `DT_CARGA`) se desejado.
+
+### 1.1 DDL (BigQuery Standard SQL)
+
+```sql
+CREATE TABLE IF NOT EXISTS
+  `case-de-engenharia-de-dados.845415315315.IASSISTANT_RESULTS` (
+    PHRASE_TEXT     STRING,
+    DT_CARGA        INT64 NOT NULL,
+    PAGE_METRICS    FLOAT64,
+    SEARCH_ITEMS    STRING,
+    PAGE_NUMBER     INT64,
+    SEARCH_RESULT   STRING,
+    PHRASE_METRICS  FLOAT64,
+    USER_ID         INT64
+  )
+PARTITION BY TIMESTAMP_MILLIS(DT_CARGA)
+OPTIONS(
+  -- expiration_timestamp = NULL  -- TTL off (use bq update --expiration 0)
+);
+
+
 ## IAM via tabela (o que eu rodei)
 
 Regra simples: `USER_ID 1..5 => READER`, `USER_ID >= 6 => WRITER` no dataset base `845415315315`. Eu gero as entradas `access[]` com `bq` + `jq` e aplico sem duplicar.
@@ -116,6 +165,19 @@ Nota: emails ficticios/inexistentes o BigQuery recusa (nao entram na policy).
 - Índice (FAISS/serviço gerenciado) persistente em volume Docker (`data_vectors`) ou serviço externo.
 
 ---
+
+2) Tabela: 845415315315.user_iassistant
+3) 
+| Campo       | Tipo   | Nulo | Descrição                        | Exemplo                                     |
+| ----------- | ------ | ---- | -------------------------------- | ------------------------------------------- |
+| REGION      | STRING | SIM  | Região (BR, US, …)               | "BR"                                        |
+| USER\_EMAIL | STRING | SIM  | Email (hash/mask quando for PII) | "[user@domain.com](mailto:user@domain.com)" |
+| USER\_NAME  | STRING | SIM  | Nome de exibição                 | "Maria"                                     |
+| USER\_ID    | INT64  | NÃO  | ID de usuário interno            | 564                                         |
+| DT\_CARGA   | INT64  | NÃO  | Timestamp de carga (epoch)       | 1727368685                                  |
+
+
+2.1 DDL (BigQuery Standard SQL)
 
 ## 3) Renderização (API + Dashboard)
 
