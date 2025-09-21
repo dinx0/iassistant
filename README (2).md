@@ -2386,3 +2386,518 @@ Extensão manda contexto; APIs processam e persistem; Dash explica; BigQuery gov
 Máscaras nas views, Data Access Logs para auditoria, e métricas para sinalizar bypass.
 
 OpenAI aqui é para resumo/rotulagem, não decide ranking (o ranking é matemático e auditável).
+
+
+
+# IAssistant — Log vivo de execução (Runbook)
+
+> **Documento de trabalho** para executar e registrar comandos/outputs **reais**. Consolidado a partir do seu README (Authorized Views/IAM/Logs/GitHub Activity, instalação, Docker/Terraform, extensão Chrome) e da estrutura nova (ordem: **IA → Banco → Orquestração → Mascaramento → Backup/DR → Observabilidade → Uso/API → TCO → Anexos**). Substitua as **amostras** pelos **outputs do seu ambiente**.
+
+---
+
+## 📚 Índice rápido
+
+1. [Inteligência Artificial](#1-inteligência-artificial)
+2. [Banco de Dados (BQ)](#2-banco-de-dados-bq)
+   2.1 [Criação de Tabelas e Dicionarização](#21-criação-de-tabelas-e-dicionarização)
+   2.2 [Views & Authorized Views](#22-views--authorized-views)
+   2.3 [Scripts (DDL/DML) + Outputs](#23-scripts-ddldml--outputs)
+3. [Orquestração (Airflow/Terraform/GitHub)](#3-orquestração-airflowterraformgithub)
+4. [Mascaramento & IAM](#4-mascaramento--iam)
+5. [Backup & DR (GCS ↔ BigQuery)](#5-backup--dr-gcs--bigquery)
+6. [Observabilidade (Logs/Métricas)](#6-observabilidade-logsmétricas)
+7. [Uso / API / Dash / Chrome Extension](#7-uso--api--dash--chrome-extension)
+8. [TCO (antes/depois)](#8-tco-antesdepois)
+9. [GitHub Activity (BQ em US)](#9-github-activity-bq-em-us)
+10. [Exportar/Aplicar Infra BQ (repo)](#10-exportaraplicar-infra-bq-repo)
+11. [Instalação & Variáveis (API/Dash)](#11-instalação--variáveis-apidash)
+12. [Docker (volumes persistentes)](#12-docker-volumes-persistentes)
+13. [Fluxo de Commit](#13-fluxo-de-commit)
+
+---
+
+## 1) Inteligência Artificial
+
+**Visão**: RAG com embeddings (dim 768/1536), `top_k` 3–5 (+ rerank) e telemetria em `IASSISTANT_RESULTS`.
+**Pipeline**: Ingestão → Limpeza/Chunking (200–500 tokens; overlap 40–80) → Embeddings → Índice → RAG → Geração → **Telemetria** (latência, tokens, score).
+**Métricas**: `latency_ms`, `similarity_avg`, `tokens_prompt/completion`, taxa de respostas com fontes.
+
+**Exemplo `/ask` (amostra)**
+
+```json
+{
+  "answer": "Particione por data e use clustering nas colunas de filtro…",
+  "sources": [{"title":"Guia BQ","url":"https://intranet/bq"}],
+  "latency_ms": 389,
+  "tokens_prompt": 1180,
+  "tokens_completion": 176,
+  "model": "gpt-4o-mini",
+  "top_k": 4,
+  "rerank": true,
+  "similarity_avg": 0.82,
+  "timestamp": "2025-09-21T03:10:17Z"
+}
+```
+
+---
+
+## 2) Banco de Dados (BQ)
+
+**Projeto**: `case-de-engenharia-de-dados` | **Região**: `southamerica-east1`
+**Datasets**: **Base** `845415315315` | **Views (consumo)** `sec_v`
+**Tabelas Base**: `IASSISTANT_RESULTS`, `user_iassistant`, `phrase_metrics`
+**Relacionamento**: `user_iassistant.USER_ID (INT64)` ↔ `phrase_metrics.user_id (STRING)` via `CAST`.
+**TTL**: tabelas tinham TTL 60d. ➜ remover com `bq update --expiration 0 <tabela>` se precisar retenção longa.
+
+### 2.1) Criação de Tabelas e Dicionarização
+
+**`845415315315.IASSISTANT_RESULTS`**
+
+| Campo           | Tipo    | Nulo | Descrição                                   |
+| --------------- | ------- | ---: | ------------------------------------------- |
+| PHRASE\_TEXT    | STRING  |  SIM | Frase do usuário (texto livre)              |
+| DT\_CARGA       | INT64   |  NÃO | Epoch de carga (preferir TIMESTAMP em prod) |
+| PAGE\_METRICS   | FLOAT64 |  SIM | Métrica de página                           |
+| SEARCH\_ITEMS   | STRING  |  SIM | IDs/itens consultados                       |
+| PAGE\_NUMBER    | INT64   |  SIM | Página                                      |
+| SEARCH\_RESULT  | STRING  |  SIM | Trecho/resultado                            |
+| PHRASE\_METRICS | FLOAT64 |  SIM | Score semântico                             |
+| USER\_ID        | INT64   |  SIM | ID interno (PII)                            |
+
+**`845415315315.user_iassistant`**
+
+| Campo       | Tipo   | Nulo | Descrição                  |
+| ----------- | ------ | ---: | -------------------------- |
+| REGION      | STRING |  SIM | Região ou "lat,lon"        |
+| USER\_EMAIL | STRING |  SIM | E‑mail (mascarado em view) |
+| USER\_NAME  | STRING |  SIM | Nome de exibição           |
+| USER\_ID    | INT64  |  NÃO | PK lógica                  |
+| DT\_CARGA   | INT64  |  NÃO | Epoch de carga             |
+
+**`845415315315.phrase_metrics`**
+
+| Campo           | Tipo    | Nulo | Descrição         |
+| --------------- | ------- | ---: | ----------------- |
+| user\_id        | STRING  |  SIM | FK para usuário   |
+| PHRASE\_METRICS | FLOAT64 |  SIM | Score semântico   |
+| PHRASE\_TEXT    | STRING  |  SIM | Texto da frase    |
+| PAGE\_METRICS   | INT64   |  SIM | Métrica de página |
+| PAGE\_NUMBER    | INT64   |  SIM | Página            |
+| SEARCH\_ITEMS   | STRING  |  SIM | Itens/IDs         |
+| SEARCH\_RESULT  | STRING  |  SIM | Trecho/resultado  |
+| DT\_CARGA       | INT64   |  SIM | Epoch de carga    |
+
+> **Partição/Cluster**: particionar por tempo (hora/dia) e clusterizar por chaves de filtro (`USER_ID`, `DT_CARGA`).
+
+### 2.2) Views & Authorized Views
+
+**`sec_v.user_iassistant_v`** — máscara de email + `lat,lon` arredondados 2 casas
+
+```sql
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.user_iassistant_v` AS
+SELECT
+  CAST(USER_ID AS INT64) AS user_id,
+  CONCAT(SUBSTR(LOWER(TRIM(USER_EMAIL)),1,1),'***',REGEXP_EXTRACT(LOWER(TRIM(USER_EMAIL)), r'(@.*)$')) AS email_mascarado,
+  ROUND(IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>0,
+           CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(0)] AS FLOAT64), NULL),2) AS lat_mascarada,
+  ROUND(IF(ARRAY_LENGTH(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)'))>1,
+           CAST(REGEXP_EXTRACT_ALL(REGION, r'(-?[0-9]+(?:\.[0-9]+)?)')[OFFSET(1)] AS FLOAT64), NULL),2) AS lon_mascarada
+FROM `case-de-engenharia-de-dados.845415315315.user_iassistant`;
+```
+
+**`sec_v.phrase_metrics_v`** — redução de texto sensível
+
+```sql
+CREATE OR REPLACE VIEW `case-de-engenharia-de-dados.sec_v.phrase_metrics_v` AS
+SELECT
+  CAST(user_id AS STRING) AS user_id,
+  CAST(PHRASE_METRICS AS FLOAT64) AS phrase_metrics,
+  IFNULL(SUBSTR(PHRASE_TEXT, 1, 20) || '...', NULL) AS phrase_text_masked,
+  CAST(PAGE_METRICS AS INT64) AS page_metrics,
+  CAST(PAGE_NUMBER AS INT64) AS page_number,
+  SEARCH_ITEMS AS search_items,
+  IFNULL(SUBSTR(SEARCH_RESULT, 1, 60) || '...', NULL) AS search_result_masked,
+  CAST(DT_CARGA AS INT64) AS dt_carga
+FROM `case-de-engenharia-de-dados.845415315315.phrase_metrics`;
+```
+
+**Autorizar as views no dataset base**
+
+```bash
+BASE="case-de-engenharia-de-dados:845415315315"
+LOC=$(bq show --format=prettyjson "$BASE" | jq -r .location)
+bq rm -f -d case-de-engenharia-de-dados:sec_v 2>/dev/null || true
+bq mk --dataset --location="$LOC" case-de-engenharia-de-dados:sec_v
+bq show --format=prettyjson "$BASE" > base.json
+jq '.access += [
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"user_iassistant_v"}},
+  {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"phrase_metrics_v"}}
+] | .access |= (map(tojson)|unique|map(fromjson))' base.json > base_patched.json
+bq update --source=base_patched.json "$BASE"
+```
+
+### 2.3) Scripts (DDL/DML) + Outputs
+
+**Criação de views (amostra de `bq query`)**
+
+```text
+Waiting on bqjob_... DONE
+View case-de-engenharia-de-dados:sec_v.user_iassistant_v created
+Waiting on bqjob_... DONE
+View case-de-engenharia-de-dados:sec_v.phrase_metrics_v created
+```
+
+**Diff de `access[]` (amostra)**
+
+```diff
+@@ dataset.access @@
++ {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"user_iassistant_v"}}
++ {"view":{"projectId":"case-de-engenharia-de-dados","datasetId":"sec_v","tableId":"phrase_metrics_v"}}
+```
+
+**Validação base vs view (amostra)**
+
+```text
+Base: 124,531  |  View: 124,531
+```
+
+---
+
+## 3) Orquestração (Airflow/Terraform/GitHub)
+
+**Airflow DAG** `ingest_events_daily` (`retries=3`, `SLA=30m`)
+
+```python
+with DAG(
+  dag_id="ingest_events_daily",
+  schedule="0 * * * *",
+  sla=timedelta(minutes=30),
+  default_args={"retries":3, "retry_delay": timedelta(minutes=5)}
+) as dag:
+  ingest = BashOperator(task_id="ingest", bash_command="python3 etl/ingest.py")
+  load_bq = BashOperator(task_id="load_bq", bash_command="python3 etl/load_bq.py")
+  ingest >> load_bq
+```
+
+**Logs (amostra)**
+
+```text
+[23:00:03] ingest START → 18,245 eventos → SUCCESS (21.1s)
+[23:00:24] load_bq START → 18,245 rows em phrase_metrics → SUCCESS (17.0s)
+DAG SUCCESS (38.1s, SLA OK)
+```
+
+**Terraform mínimo (BQ + GCS)**
+
+```hcl
+terraform {
+  required_version = ">= 1.5.0"
+  required_providers { google = { source = "hashicorp/google", version = "~> 5.0" } }
+}
+provider "google" { project = "case-de-engenharia-de-dados" region = "southamerica-east1" }
+resource "google_bigquery_dataset" "iassistant" { dataset_id = "iassistant" location = "southamerica-east1" default_table_expiration_ms = 0 }
+resource "google_storage_bucket" "snapshots" { name = "dadosinteligenciaassistant" location = "US" force_destroy = true uniform_bucket_level_access = true }
+```
+
+**Plan/Apply (amostras)**
+
+```text
+Plan: 2 to add, 0 to change, 0 to destroy.
+Apply complete! Resources: 2 added.
+```
+
+---
+
+## 4) Mascaramento & IAM
+
+**Padrão**: consumidores só no dataset `sec_v` (views); **sem grants** no base.
+**RLS/Policy Tags**: melhoria futura.
+
+**IAM dinâmico por tabela (script `bq` + `jq`)**
+
+```bash
+export PROJECT_ID="case-de-engenharia-de-dados"
+export DATASET_ID="845415315315"
+export DATASET_REF="$PROJECT_ID:$DATASET_ID"
+export SRC_TABLE="$PROJECT_ID.$DATASET_ID.user_iassistant"
+
+bq query --nouse_legacy_sql --format=csv "
+WITH base AS (
+  SELECT DISTINCT CAST(USER_ID AS INT64) AS user_id,
+         LOWER(TRIM(USER_EMAIL)) AS email
+  FROM \`$SRC_TABLE\`
+  WHERE USER_EMAIL IS NOT NULL
+)
+SELECT email,
+       CASE WHEN user_id BETWEEN 1 AND 5 THEN 'READER' ELSE 'WRITER' END AS role
+FROM base
+" | tail -n +2 | while IFS=, read -r email role; do
+  [[ -z "$email" || -z "$role" ]] && continue
+  bq show --format=prettyjson "$DATASET_REF" > ds.tmp.json
+  jq --arg em "$email" --arg r "$role" \
+     '.access += [{"role":$r,"userByEmail":$em}] | .access |= (map(tojson)|unique|map(fromjson))' \
+     ds.tmp.json > ds.apply.json
+  bq update --source=ds.apply.json "$DATASET_REF"
+  rm -f ds.tmp.json ds.apply.json
+done
+```
+
+**Testes esperados**
+
+```text
+Base → PERMISSION_DENIED
+View → sucesso (linhas retornadas)
+```
+
+---
+
+## 5) Backup & DR (GCS ↔ BigQuery)
+
+**Export diário (Parquet)** — PowerShell/Linux
+
+```bash
+bucket='dadosinteligenciaassistant'; prefix='backup/'$(date +%Y%m%d_%H%M%S)
+# IASSISTANT_RESULTS
+bq --location=southamerica-east1 extract --destination_format=PARQUET \
+  case-de-engenharia-de-dados:845415315315.IASSISTANT_RESULTS \
+  gs://$bucket/$prefix/IASSISTANT_RESULTS/*.parquet
+# user_iassistant
+bq --location=southamerica-east1 extract --destination_format=PARQUET \
+  case-de-engenharia-de-dados:845415315315.user_iassistant \
+  gs://$bucket/$prefix/user_iassistant/*.parquet
+```
+
+**Outputs (amostras)**
+
+```text
+IASSISTANT_RESULTS → 3 files, 124,531 rows, 78.4 MB
+user_iassistant → 1 file, 8,912 rows, 4.6 MB
+```
+
+**Restore (amostra)**
+
+```bash
+bq --location=southamerica-east1 load --replace --source_format=PARQUET \
+  case-de-engenharia-de-dados:iassistant.IASSISTANT_RESULTS \
+  gs://dadosinteligenciaassistant/backup/202509__/IASSISTANT_RESULTS/*.parquet
+bq --location=southamerica-east1 load --replace --source_format=PARQUET \
+  case-de-engenharia-de-dados:iassistant.user_iassistant \
+  gs://dadosinteligenciaassistant/backup/202509__/user_iassistant/*.parquet
+```
+
+**Output (amostra)**
+
+```text
+Loaded 124,531 rows (scan: 312.9 MB, billed: 0). Partitioning: hourly
+```
+
+---
+
+## 6) Observabilidade (Logs/Métricas)
+
+**Habilitar** Data Access Logs (BQ & Storage API).
+**Métricas**: `read_base_dataset_metric`, `read_via_view_metric`, `query_ref_base_table_metric`, `base_table_dml_metric`, `base_schema_or_policy_change_metric`, `heavy_query_metric`.
+
+**Consulta de logs (amostra)**
+
+```bash
+gcloud logging read 'resource.type="bigquery_resource" AND protoPayload.metadata.jobChange.job.jobStats.totalBilledBytes>=1073741824' \
+ --limit=3 --format='table timestamp,protoPayload.metadata.jobChange.job.jobName.jobId,totalBilledBytes'
+```
+
+**Output (amostra)**
+
+```text
+2025-09-20T21:41:03Z  job_x8ab1...  1825361101
+2025-09-20T16:10:55Z  job_y7123...  1497892381
+2025-09-19T02:07:18Z  job_z77df...  1287654321
+```
+
+**Checks de Qualidade (SQL)**
+
+```text
+COUNT base: 8,912  |  COUNT view: 8,912
+Máscara de e‑mail: ok (j***@, m***@, a***@, ...)
+```
+
+---
+
+## 7) Uso / API / Dash / Chrome Extension
+
+**API** `/ask` (curl)
+
+```bash
+curl -s -X POST https://api.iassistant.local/ask \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"q":"Como reduzir custos no BigQuery?","top_k":4,"rerank":true}'
+```
+
+**Resposta (amostra)** — ver seção 1.
+
+**Dash**: `python dash_server.py` (porta **8080**) e `python services/dash_process.py` (porta **8081**).
+**Chrome Extension (Manifest V3)**
+
+* Instalar: `chrome://extensions` → **Modo dev** → **Carregar sem compactação** → `IAssistant/extension`.
+* Em `index.html`, ajustar endpoints:
+
+```html
+<script>
+  const defaultConfig = {
+    API_METRICS_URL: "http://localhost:8080/api/metrics",
+    API_GRAPHICS_URL: "http://localhost:8080/graphics",
+    API_UPLOAD_URL:  "http://localhost:5000/uploadData",
+    API_GPT_URL:     "http://localhost:8080/gpt/complete"
+  };
+</script>
+```
+
+* Atalhos/Omnibox: `Ctrl/⌘+B` e palavra‑chave `assistente`.
+* Comandos: `show graphics` / `show metrics` (ajustar URLs fora de localhost).
+
+---
+
+## 8) TCO (antes/depois)
+
+| Cenário                      | totalBilledBytes | Custo Estimado | Observações               |
+| ---------------------------- | ---------------: | -------------: | ------------------------- |
+| Antes (sem partição/cluster) |          1.82 GB |      US\$ 9.10 | Full scan histórico       |
+| Depois (partição por hora)   |          0.32 GB |      US\$ 1.60 | Filtro por janela recente |
+| Depois + cluster (user\_id)  |          0.19 GB |      US\$ 0.95 | Pruning eficiente         |
+| **Redução total**            |         **−89%** |       **−89%** | —                         |
+
+> Substitua pelos números reais assim que tiver as medições.
+
+---
+
+## 9) GitHub Activity (BQ em US)
+
+**Importante**: o dataset `github_activity` fica em **US** — sempre use `--location=US`.
+**Stars/Forks**
+
+```sql
+-- stars
+SELECT DATE(created_at) AS dia, COUNT(*) AS stars
+FROM `case-de-engenharia-de-dados.github_activity.events`
+WHERE repo.name = 'dinx0/iassistant' AND type = 'WatchEvent'
+GROUP BY dia ORDER BY dia DESC;
+
+-- forks
+SELECT DATE(created_at) AS dia, COUNT(*) AS forks
+FROM `case-de-engenharia-de-dados.github_activity.events`
+WHERE repo.name = 'dinx0/iassistant' AND type = 'ForkEvent'
+GROUP BY dia ORDER BY dia DESC;
+```
+
+---
+
+## 10) Exportar/Aplicar Infra BQ (repo)
+
+**Export (ambiente → git)**
+
+```bash
+PROJECT=case-de-engenharia-de-dados
+BASE_DS=845415315315
+VIEWS_DS=sec_v
+mkdir -p sql/views infra/bq schema data/samples
+bq show --format=prettyjson $PROJECT:$VIEWS_DS.user_iassistant_v | jq -r .view.query > sql/views/user_iassistant_v.sql
+bq show --format=prettyjson $PROJECT:$VIEWS_DS.phrase_metrics_v  | jq -r .view.query > sql/views/phrase_metrics_v.sql
+bq show --format=prettyjson $PROJECT:$BASE_DS | jq '{access}' > infra/bq/dataset_access.json
+bq show --schema --format=prettyjson $PROJECT:$BASE_DS.user_iassistant > schema/user_iassistant.schema.json
+bq show --schema --format=prettyjson $PROJECT:$BASE_DS.phrase_metrics > schema/phrase_metrics.schema.json
+```
+
+**Apply (git → ambiente)**
+
+```bash
+PROJECT=case-de-engenharia-de-dados
+BASE_DS=845415315315
+VIEWS_DS=sec_v
+BASE="$PROJECT:$BASE_DS"; VIEWS="$PROJECT:$VIEWS_DS"
+LOC=$(bq show --format=prettyjson "$BASE" | jq -r .location)
+bq mk --dataset --location="$LOC" "$VIEWS" 2>/dev/null || true
+jq '{access}' infra/bq/dataset_access.json > /tmp/ds_access.json
+bq show --format=prettyjson "$BASE" | jq '.access = (input.access)' /tmp/ds_access.json > /tmp/base_apply.json
+bq update --source=/tmp/base_apply.json "$BASE"
+bq query --use_legacy_sql=false --location="$LOC" < sql/views/user_iassistant_v.sql
+bq query --use_legacy_sql=false --location="$LOC" < sql/views/phrase_metrics_v.sql
+```
+
+**Scripts utilitários**: `scripts/export_bq.sh`, `scripts/apply_bq.sh` (automatizam os blocos acima).
+
+---
+
+## 11) Instalação & Variáveis (API/Dash)
+
+**Variáveis**
+
+```env
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_AGENT_ID=
+OPENAI_INSTRUCTIONS="Responda com até {0} opções claras..."
+```
+
+**Subir serviços (2 terminais)**
+
+```bash
+python dash_server.py            # porta 8080
+python services/dash_process.py  # porta 8081
+```
+
+---
+
+## 12) Docker (volumes persistentes)
+
+**Observações**: volumes `data_*` para API/Dash/índice; BQ permanece fora do container.
+Exemplo (trecho):
+
+```yaml
+postgres:
+  image: postgres:15
+  environment:
+    - POSTGRES_PASSWORD=secret
+  volumes:
+    - pgdata:/var/lib/postgresql/data
+minio:
+  image: minio/minio
+  command: server /data
+  volumes:
+    - minio_data:/data
+
+volumes:
+  pgdata:
+  minio_data:
+```
+
+---
+
+## 13) Fluxo de Commit
+
+```bash
+git config --global user.name "Dih Oliver"
+git config --global user.email "dih.oliver08@gmail.com"
+
+git clone https://github.com/dinx0/iassistant.git
+cd iassistant
+
+# edite README.md (ou gere via este runbook)
+
+git add README.md docker-compose.yml terraform/*
+git commit -m "docs: README completo (BigQuery + views + logs + github activity)"
+
+# autenticar e enviar (GitHub CLI)
+sudo apt-get update && sudo apt-get install -y gh
+gh auth login -w
+
+git branch -M main
+git push -u origin main
+```
+
+---
+
+### 🧾 Como usar este runbook
+
+1. Execute cada comando e **cole o output real** sobre a amostra correspondente.
+2. Quando finalizar, peça: **“Gerar README final + commit message a partir do log vivo.”**
+3. Eu consolido tudo em um `README.md` pronto para commit.
+
